@@ -1,0 +1,30 @@
+# Hermes Layered Memory (HLM) — config
+# Copy to ~/.hermes/profiles/<profile>/hermes-layered-memory.json
+# All environment-specific settings are in .env.
+# These comment lines are for explanation only — remove them before use.
+# Set env vars in ~/.hermes/profiles/<profile>/.env (see .env.example)
+{
+  "collections": {
+    "SYSTEM": "memories",
+    "USER-DATA": "memories",
+    "ENV-DATA": "memories",
+    "SESSION-DATA": "sessions",
+    "OBSIDIAN": "vault",
+    "CODE": "code",
+    "CUSTOM": "memories"
+  },
+  "scoring": {
+    "bm25_weight": 0.7,
+    "importance_weight": 0.15,
+    "recency_weight": 0.15,
+    "topic_boost": 0.3,
+    "keyword_boost": 0.15,
+    "pinned_boost": 1.5,
+    "recency_half_life_days": 21,
+    "rrf_constant": 60
+  },
+  "enrich_on_add": "low_confidence",
+  "query_expand": false,
+  "min_bm25_threshold": 0.0,
+  "dedup_threshold": 0.97
+}
