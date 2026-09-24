@@ -1,0 +1,42 @@
+
+code_review_findings*.md
+*.db
+dispatch-results.json
+e2e.log
+# drops its output here. t37.py's MCP server log landed in a working tree that
+# E2E scratch harnesses are rebuilt per session and are not in the repo, but
+github/
+layered-test.db
+local/
+mcp-server-*.log
+mess.log
+*.pyc
+__pycache__/
+# Python
+qdrant-data/
+# Qdrant data (bind mount)
+regression-results.json
+sessions.txt
+t37-server.log
+# Test artifacts
+# Test databases
+tests/dispatch-results.json
+# they write artifacts relative to the cwd — so running one from the repo root
+# was about to be committed with `git add -A`.
+
+# One-off ops/probe scripts. Several build a LayeredBackend against a LIVE
+# profile database (see .claude/repair_step1.py, profile-b.db) — the
+# exact pattern docs/e2e-execution.md forbids and the 0.8.20 changelog names
+# as a cause of two data-loss incidents. Committed, they are standing
+# instructions a future session might run. Scoped to scripts so shared
+# .claude config (agents, settings) can still be tracked deliberately.
+# 2026-08-26 external sweep, N2.
+.claude/*.py
+
+# A SQLite URI used as a filename. `sqlite3 "file:$DB?mode=ro" ...` creates a
+# real file under that literal name when URI handling is off, and `*.db` does
+# not match it because the name ends in `?mode=ro`. One such file — 265 rows of
+# real memory content — was committed and pushed on 2026-08-27.
+# T590 is the check that does not depend on the name at all.
+file:*
+*mode=ro*

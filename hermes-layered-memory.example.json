@@ -14,17 +14,62 @@
     "CUSTOM": "memories"
   },
   "scoring": {
-    "bm25_weight": 0.7,
-    "importance_weight": 0.15,
-    "recency_weight": 0.15,
-    "topic_boost": 0.3,
-    "keyword_boost": 0.15,
+    "bm25_weight": 0.30,
+    "importance_weight": 0.05,
+    "recency_weight": 0.05,
+    "topic_boost": 0.05,
+    "keyword_boost": 0.05,
     "pinned_boost": 1.5,
     "recency_half_life_days": 21,
     "rrf_constant": 60
   },
+  "conflict_thresholds": {
+    "cosine_min": 0.85,
+    "jaccard_min": 0.7,
+    "jaccard_max": 1.0,
+    "temporal_guard_days": 7,
+    "source_guard_days": 30
+  },
   "enrich_on_add": "low_confidence",
   "query_expand": false,
   "min_bm25_threshold": 0.0,
-  "dedup_threshold": 0.97
+  "dedup_threshold": 0.97,
+  "dedup_warning_threshold": 0.95,
+  "heuristic_map": {
+    "ENV-DATA": {
+      "hw": ["gpu", "cuda", "ram", "cpu", "nvidia", "rtx", "blackwell", "vram", "wsl", "ubuntu", "linux", "kernel", "memory size", "cores", "clock", "throttle", "thermal"],
+      "sw": ["python", "pip", "docker", "node", "npm", "vscode", "git", "ssh", "proxy", "package", "install", "brew", "apt", "pipx", "venv", "conda", "driver", "sdk", "toolchain"],
+      "net": ["endpoint", "api key", "url", "hostname", "port", "dns", "firewall", "localhost", "vllm", "ollama", "qdrant", "whisper", "http", "https", "tcp", "grpc", "socket", "reverse proxy", "nginx"],
+      "workflow": ["kanban", "delegate", "worker", "session", "profile", "orchestrate", "pipeline", "cron", "schedule", "automation", "recurring", "ci/cd", "deployment"],
+      "conventions": ["naming", "convention", "format", "standard", "pattern", "prefix", "suffix", "camelcase", "snake_case", "kebab-case", "file structure", "directory layout"],
+      "troubleshooting": ["error", "fix", "bug", "workaround", "issue", "debug", "crash", "timeout", "fail", "resolve", "patch", "hotfix", "segfault", "oom", "out of memory"]
+    },
+    "USER-DATA": {
+      "preferences": ["prefer", "like", "always", "never", "want", "wish", "avoid", "dislike", "enjoy", "favor", "choice"],
+      "habits": ["always", "usually", "tend", "habit", "routine", "coding style", "comment", "docstring", "naming", "indent"],
+      "conventions": ["naming", "convention", "format", "standard", "pattern", "prefix", "suffix", "camelcase", "snake_case", "kebab-case", "file structure", "directory layout"],
+      "style": ["tone", "concise", "verbose", "detailed", "brief", "formal", "casual", "language", "respond", "communication"]
+    },
+    "SYSTEM": {
+      "identity": ["agent", "persona", "identity", "system", "role", "hermes", "assistant", "bot"],
+      "rules": ["must", "never", "forbidden", "restricted", "rule", "constraint", "requirement", "mandatory", "do not"]
+    },
+    "SESSION-DATA": {
+      "session": ["session", "current", "working on", "investigate", "exploring"]
+    }
+  },
+  "cleanup": {
+    "duplicate_archive_trust": 0.2,
+    "archive_age_days": 365,
+    "purge_deleted_hours": 24,
+    "purge_archived_hours": 168,
+    "decay_min_age_days": 30,
+    "decay_max_age_days": 365,
+    "decay_rate": 0.05,
+    "decay_min_score": 0.1,
+    "enrichment_batch": 20,
+    "maintenance_after_inserts": 10,
+    "vacuum_free_page_pct": 20,
+    "maintenance_budget": 2
+  }
 }

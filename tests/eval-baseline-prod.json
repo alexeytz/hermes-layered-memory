@@ -1,0 +1,33 @@
+{
+  "fingerprint": {
+    "corpus_records": 758,
+    "dense_queries": 10,
+    "embedder": "qwen3-embedding:8b",
+    "filler": 500,
+    "golden_records": 258,
+    "hard_queries": 50,
+    "k": 5,
+    "queries": 113,
+    "spread": true
+  },
+  "layers": {
+    "0": {
+      "dense_recall@5": 0.5,
+      "hard_recall@5": 0.92,
+      "mrr": 0.782,
+      "recall@5": 0.903
+    },
+    "1": {
+      "dense_recall@5": 0.5,
+      "hard_recall@5": 0.92,
+      "mrr": 0.782,
+      "recall@5": 0.903
+    },
+    "2": {
+      "dense_recall@5": 0.6,
+      "hard_recall@5": 0.9,
+      "mrr": 0.764,
+      "recall@5": 0.903
+    }
+  }
+}
