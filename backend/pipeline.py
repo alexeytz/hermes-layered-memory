@@ -42,6 +42,24 @@ def retrieve(self, query: str, max_layer: int = 2,
              profile_name: str = None, cross_profile: bool = False,
              limit: int = 5, rerank: bool = False, source: str = "explicit",
              status: str = "active") -> List[Dict[str, Any]]:
+    # The SQL-bound filters, through the same chokepoint helper the other
+    # filtered readers use. `delete_many`, `graph_health` and `get_taxonomy`
+    # all call `require_str_filters`; `retrieve` — the most-used read path of
+    # the six — was the one that did not. Driven 2026-09-26 against a store
+    # holding three matching records:
+    #
+    #     data_type="CUSTOM"    -> 3 results       (control)
+    #     data_type=["CUSTOM"]  -> TypeError: unhashable type: 'list', escaping
+    #     data_type=99          -> 0 results, no error
+    #     scope=7 / data_id=5   -> 0 results, no error
+    #
+    # An int filter makes "no results" indistinguishable from "no matches",
+    # which is the failure this codebase treats as worse than a crash: the
+    # caller reads an empty list as an answer. `T710`.
+    _C.require_str_filters(scope=scope, data_type=data_type, data_id=data_id,
+                           session_name=session_name, profile_name=profile_name,
+                           status=status)
+
     # Clamp: unvalidated, a negative limit yields "all but the last result"
     # via Python negative-slice semantics downstream (records[:limit]) rather
     # than an empty result or error, and limit*3 forwarded to _fts5_fallback

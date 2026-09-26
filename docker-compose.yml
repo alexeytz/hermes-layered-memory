@@ -7,6 +7,11 @@ services:
       - "6333:6333"
       - "6334:6334"
     volumes:
+      # Bind mount, not a named volume: the vectors stay visible on the host
+      # and can be backed up with ordinary tools. The cost is that the
+      # container creates this directory as root, so removing it needs either
+      # the container's own root (see README) or sudo — measured on a clean
+      # non-root install, 2026-09-25.
       - ./qdrant-data:/qdrant/storage
     environment:
       - QDRANT__SERVICE__GRPC_PORT=6334

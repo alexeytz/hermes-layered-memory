@@ -205,11 +205,10 @@ def re_enrich(self, topic_only: bool = False, keyword_only: bool = False, limit:
     if topic_only:
         where_clauses.append("(topic IS NULL OR topic = '')")
     elif keyword_only:
-        where_clauses.append("(keywords IS NULL OR keywords = '' OR keywords = '[]')")
+        where_clauses.append(_C.SQL_KEYWORDS_MISSING)
     else:
         where_clauses.append(
-            "(topic IS NULL OR topic = '' OR "
-            "keywords IS NULL OR keywords = '' OR keywords = '[]')"
+            "((topic IS NULL OR topic = '') OR " + _C.SQL_KEYWORDS_MISSING + ")"
         )
 
     if limit > 0:
@@ -553,8 +552,8 @@ def enrich_existing(self, since: str = None, max_items: int = _C.ENRICH_MAX_ITEM
     all_records = []
 
     # Pass 1: empty fields
-    where = "(topic IS NULL OR topic = '') AND (keywords IS NULL OR keywords = '[]' OR keywords = 'null')"\
-            " AND status = 'active'"
+    where = ("(topic IS NULL OR topic = '') AND " + _C.SQL_KEYWORDS_MISSING
+             + " AND status = 'active'")
     params = []
     if since:
         where += " AND updated_at > ?"
@@ -578,8 +577,7 @@ def enrich_existing(self, since: str = None, max_items: int = _C.ENRICH_MAX_ITEM
     # unconditional UPDATE below then overwrote good topic/keywords/data_id
     # with the classifier's Nones.
     where2 = ("data_type = 'CUSTOM' AND status = 'active' AND ("
-              "topic IS NULL OR topic = '' OR "
-              "keywords IS NULL OR keywords = '[]' OR keywords = 'null' OR "
+              "topic IS NULL OR topic = '' OR " + _C.SQL_KEYWORDS_MISSING + " OR "
               "data_id IS NULL OR data_id = '')")
     params2 = []
     if since:
@@ -760,7 +758,7 @@ def enrich_existing(self, since: str = None, max_items: int = _C.ENRICH_MAX_ITEM
             "  data_type = COALESCE(?, data_type), "
             "  data_id = COALESCE(NULLIF(data_id, ''), ?), "
             "  topic = COALESCE(NULLIF(topic, ''), ?), "
-            "  keywords = CASE WHEN keywords IS NULL OR keywords IN ('', '[]', 'null') "
+            "  keywords = CASE WHEN " + _C.SQL_KEYWORDS_MISSING + " "
             "                  THEN COALESCE(?, keywords) ELSE keywords END, "
             "  updated_at = ? "
             "WHERE uuid = ?",

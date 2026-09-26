@@ -116,6 +116,48 @@ def _safe_error(context: str, e: Exception) -> str:
     return f"{context} failed: {type(e).__name__}"
 
 
+def _refusal_or_safe_error(context: str, e: Exception) -> str:
+    """A deliberate refusal names what to change; an internal failure does not.
+
+    `mcp_server.py` already draws this distinction on the backend-lookup path
+    (0.8.31 / 2026-08-27 E-5), with a comment that states the rule: *"A
+    deliberate refusal is not an internal error … `_safe_error` reduces an
+    exception to its class, which is right for an unexpected failure on an
+    unauthenticated server and useless here: the caller sees 'get backend
+    failed: ValueError' and cannot act on it."* The write and maintenance
+    branches never got it, so every validation refusal arrived as a class name.
+
+    Driven 2026-09-26, same arguments through both doors:
+
+        add data_type='banana'  MCP: "add failed: ValueError"
+                                plugin: "data_type 'banana' is not a registered
+                                         type. Known: [...]"
+        add sensitivity=99      MCP: "add failed: ValueError"
+                                plugin: "invalid sensitivity 99 — must be 0-3"
+
+    The messages exist to be acted on — a field, a range, an allowlist — and an
+    MCP client got none of it while the plugin client got all of it.
+
+    **Fails closed on disclosure.** `_safe_error` exists because this server is
+    unauthenticated and `docs/security.md` is explicit that the risk it guards
+    is *filesystem paths* in responses. So this passes a message through only
+    when it is a deliberate refusal type **and** carries no path separator —
+    audited 2026-09-26 across all 41 `raise ValueError` sites in `store.py`,
+    none of which embeds a path, and written this way so the next one that does
+    is suppressed without anyone re-running that audit.
+
+    Applied to the write and maintenance branches, not to all 22 `_safe_error`
+    call sites: the io/backup/import errors deliberately name paths, which is
+    useful to their caller and exactly what must not cross this door.
+    """
+    if isinstance(e, (ValueError, PermissionError)):
+        msg = str(e)
+        if msg and "/" not in msg and "\\" not in msg and len(msg) <= 400:
+            logger.warning("%s refused: %s", context, msg)
+            return msg
+    return _safe_error(context, e)
+
+
 def _check_write_profile_allowed(profile: Optional[str]) -> None:
     """Restrict writes to the server's default profile unless the operator
     has explicitly opted into cross-profile writes via HLM_MCP_ALLOWED_PROFILES.
@@ -1066,7 +1108,7 @@ async def memory_write(
                     try:
                         _target = await asyncio.to_thread(be._get_record, supersedes)
                     except Exception as e:
-                        return json.dumps({"error": _safe_error("add", e)}, default=str)
+                        return json.dumps({"error": _refusal_or_safe_error("add", e)}, default=str)
                     if not _target:
                         return json.dumps(
                             {"error": "supersedes: no record %r in profile %r"
@@ -1095,7 +1137,7 @@ async def memory_write(
                         supersedes=supersedes,
                         scope=scope if scope else "personal")
                 except Exception as e:
-                    return json.dumps({"error": _safe_error("add", e)}, default=str)
+                    return json.dumps({"error": _refusal_or_safe_error("add", e)}, default=str)
                 # existing_content is the first ~200 chars of a record ALREADY
                 # in the store — obsidian, import, tool-call, any provenance —
                 # returned on a duplicate/similarity collision. The plugin's
@@ -1147,7 +1189,7 @@ async def memory_write(
                             {"error": f"memory {uuid[:8]} not found or not active"}, default=str)
                     await asyncio.to_thread(be.update, uuid, **fields)
                 except Exception as e:
-                    return json.dumps({"error": _safe_error("update", e)}, default=str)
+                    return json.dumps({"error": _refusal_or_safe_error("update", e)}, default=str)
                 # Report what `update()` will actually write, computed against
                 # its own allowlist, not this branch's input. Echoing
                 # `fields.keys()` meant the answer was a restatement of the
@@ -1177,7 +1219,7 @@ async def memory_write(
                         return json.dumps({"error": f"memory {uuid[:8]} not found"}, default=str)
                     _res = await asyncio.to_thread(be.delete, uuid)
                 except Exception as e:
-                    return json.dumps({"error": _safe_error("delete", e)}, default=str)
+                    return json.dumps({"error": _refusal_or_safe_error("delete", e)}, default=str)
                 # Report what `be.delete()` actually did rather than asserting
                 # success. The existence gate above catches a uuid that is not
                 # an *active* row, so the common miss is already an error —
@@ -1215,7 +1257,7 @@ async def memory_write(
                 except ValueError as e:
                     return json.dumps({"error": str(e)}, default=str)
                 except Exception as e:
-                    return json.dumps({"error": _safe_error("delete_many", e)}, default=str)
+                    return json.dumps({"error": _refusal_or_safe_error("delete_many", e)}, default=str)
                 return json.dumps(_res, default=str, indent=2)
             elif action == "list":
                 try:
@@ -1885,7 +1927,7 @@ async def memory_maintenance(
                         _review_impl, be, float(min_age_hours if min_age_hours is not None else 1),
                         _C.coerce_tool_bool(force), _C.coerce_tool_bool(execute)), default=str, indent=2)
             except Exception as e:
-                return json.dumps({"error": _safe_error(action, e)}, default=str)
+                return json.dumps({"error": _refusal_or_safe_error(action, e)}, default=str)
     return json.dumps({"error": f"unhandled action: {action}"}, default=str)
 
 
@@ -1923,6 +1965,9 @@ def _review_impl(be, min_age_hours: float, force: bool, execute: bool) -> dict:
     rows = conn.execute(
         "SELECT uuid, content, summary, source FROM memories "
         "WHERE status = 'active' "
+        # Same guard as the plugin twin and as sleep/decay/purge: review is a
+        # bulk retirement path and `protected` means do-not-touch. `T709`.
+        "  AND COALESCE(protected, 0) = 0"
         "  AND (julianday('now') - julianday(created_at)) * 24 >= ?" + where +
         " ORDER BY created_at LIMIT %d" % _C.REVIEW_BATCH_LIMIT, (min_age_hours,)).fetchall()
     if not rows:
@@ -1942,6 +1987,13 @@ def _review_impl(be, min_age_hours: float, force: bool, execute: bool) -> dict:
         "For each record, output exactly: KEEP <uuid> or DELETE <uuid>\n\n"
         "Records to review:\n")
     for uuid_, content, summary, source in rows:
+        # Same guard as the plugin twin: the uuid sits outside the fence, so a
+        # crafted one is prose in a prompt whose verdicts delete records. See
+        # `constants.is_record_uuid` and `T708`.
+        if not _C.is_record_uuid(uuid_):
+            logger.warning("review: skipping record whose uuid is not a uuid: %r",
+                           str(uuid_)[:40])
+            continue
         text = (summary or content or "")[:300]
         prompt += f"\n{uuid_}: {_wrap_untrusted_text(text, source)}\n"
 
@@ -1970,8 +2022,32 @@ def _review_impl(be, min_age_hours: float, force: bool, execute: bool) -> dict:
                      (verdict.lower(), be._now(), uuid_))
         if verdict == "DELETE" and execute:
             try:
-                be.delete(uuid_)
-                deleted += 1
+                # Count what the delete DID, not that the call returned.
+                # `delete()` answers `{"status": "deleted"|"not_found"}` and
+                # this gated only on "did not raise", so a `not_found` was
+                # reported to the caller as a deletion. The plugin twin has
+                # checked the status since 0.8.80 and its own comment calls
+                # this counter "closer but still not the same question" —
+                # known, and fixed on the door where it was noticed, the
+                # `T642`/`T651` shape for the third time this round.
+                #
+                # **The window is narrower than the finding that prompted it,
+                # and the difference was only visible by driving it.** The
+                # filing said a record soft-deleted from the other door in the
+                # gap after the SELECT would be miscounted. It would not:
+                # `delete()`'s UPDATE is `WHERE uuid = ?` with no status
+                # predicate, so an already-soft-deleted row still matches,
+                # `affected` is 1, and both doors count it. `not_found` needs
+                # the row to be *gone* — hard-deleted by `purge()` inside the
+                # window. Measured: `delete()` on the same uuid twice returns
+                # `{"status": "deleted"}` both times. So this is parity on a
+                # rare race, not the common one, which is what keeps it Minor;
+                # the plugin's shape is still the right one and there is no
+                # reason for the two doors to answer differently.
+                # 0.8.113, T718. 2026-09-26 review round, bundle02 F5.
+                _r = be.delete(uuid_)
+                if isinstance(_r, dict) and _r.get("status") == "deleted":
+                    deleted += 1
             except Exception as e:
                 logger.warning("MCP review: delete %s failed: %s", uuid_[:8], e)
     conn.commit()
@@ -2262,7 +2338,17 @@ async def memory_summaries(
                 return json.dumps(await asyncio.to_thread(
                     sb.sync, profile_name=prof, profile=scope), default=str, indent=2)
         except Exception as e:
-            return json.dumps({"error": _safe_error(action, e)}, default=str)
+            # The fourth dispatch door. `_refusal_or_safe_error` landed on
+            # write, maintenance and advanced's mutating block and stopped
+            # here, because its own docstring reasoned about which *messages*
+            # name paths rather than about which *doors* dispatch — so the
+            # rule was applied where it was written instead of where it
+            # holds. Summaries refusals are scope words, tag shapes and
+            # pagination bounds, none of which name a path; the ones that
+            # could (an `.md` write) carry a separator and the helper fails
+            # closed on those by construction.
+            # 0.8.113, T721. 2026-09-26 review round, bundle05 F6.
+            return json.dumps({"error": _refusal_or_safe_error(action, e)}, default=str)
     return json.dumps({"error": f"unhandled action: {action}"}, default=str)
 
 
@@ -2523,7 +2609,13 @@ async def memory_advanced(
                             "state and this server does not prefetch",
                 }, default=str, indent=2)
         except Exception as e:
-            return json.dumps({"error": _safe_error(action, e)}, default=str)
+            # `memory_advanced`'s read block. Its mutating twin ninety lines
+            # below already routes through the helper; this half validates
+            # `traces`' limit and `stats`' arguments and raised the same
+            # deliberate ValueErrors behind a class name. Same door, two
+            # catch-alls, one of them updated — the miniature of the defect
+            # bundle05 F6 describes. T721.
+            return json.dumps({"error": _refusal_or_safe_error(action, e)}, default=str)
 
         async with await _registry.lock_for(profile):
             try:
@@ -2611,7 +2703,7 @@ async def memory_advanced(
                             topic=topic, max_groups=_groups, execute=_C.coerce_tool_bool(execute))),
                         default=str, indent=2)
             except Exception as e:
-                return json.dumps({"error": _safe_error(action, e)}, default=str)
+                return json.dumps({"error": _refusal_or_safe_error(action, e)}, default=str)
     return json.dumps({"error": f"unhandled action: {action}"}, default=str)
 
 

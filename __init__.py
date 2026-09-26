@@ -3282,6 +3282,13 @@ class LayeredMemoryProvider(MemoryProvider):
             if force:
                 sql = ("SELECT uuid, content, topic, data_type, created_at, source "
                        "FROM memories WHERE status='active' "
+                       # `protected` is an explicit do-not-touch flag, and
+                       # review is a *bulk* retirement path: a DELETE verdict
+                       # reaches `delete()`, which has no guard of its own
+                       # because a single explicit uuid is the caller's choice.
+                       # sleep, decay and purge all carry this predicate;
+                       # review was the one sweep without it. `T709`.
+                       "AND COALESCE(protected, 0) = 0 "
                        "AND (julianday('now') - julianday(created_at)) * 24 >= ? "
                        "ORDER BY created_at DESC LIMIT %d" % _C.REVIEW_BATCH_LIMIT)
             else:
@@ -3306,6 +3313,7 @@ class LayeredMemoryProvider(MemoryProvider):
                        # 2026-08-23 maintenance review (F3).
                        "AND (llm_review_status IS NULL OR llm_review_status = '' "
                        "OR llm_review_status = 'delete') "
+                       "AND COALESCE(protected, 0) = 0 "
                        "AND (julianday('now') - julianday(created_at)) * 24 >= ? "
                        "ORDER BY created_at DESC LIMIT %d" % _C.REVIEW_BATCH_LIMIT)
             records = self._backend._get_conn().execute(sql, (min_age,)).fetchall()
@@ -3325,6 +3333,18 @@ class LayeredMemoryProvider(MemoryProvider):
                         "note": "nothing to review"}
 
             for r in records:
+                # Defence in depth for rows that predate the import guard: the
+                # uuid is interpolated outside the fence, so one carrying
+                # instruction text would be prose in this prompt. Rows written
+                # by this code cannot fail here; rows imported before 0.8.113
+                # can. Skipping is the safe direction — an unreviewed record
+                # keeps its status, while a poisoned prompt can delete its
+                # siblings (the verdict allowlist is the batch). `T708`.
+                if not _C.is_record_uuid(r[0]):
+                    logger.warning(
+                        "review: skipping record whose uuid is not a uuid: %r",
+                        str(r[0])[:40])
+                    continue
                 _topic = _wrap_untrusted(r[2] or "", r[5])
                 _content = _wrap_untrusted((r[1] or "")[:200], r[5])
                 prompt += f"[{r[0]}] topic={_topic} type={r[3]} created={r[4]}\n"

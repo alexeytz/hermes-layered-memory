@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from .constants import (EXTRACTION_HOOKS, HLM_TEST_MARKER, HISTORY_MAX_SIZE,
                         HISTORY_ROTATE_KEEP, VALID_DATA_TYPES,
+                        SQL_KEYWORDS_MISSING,
                         UPDATE_ALLOWED_FIELDS,
                         require_str_filters,
                         _validate_config_value)
@@ -700,7 +701,10 @@ def register_taxonomy(self, name: str, kind: str = "data_type",
     # calling the class handled is what left this one behind.
     ts = self._now()
     # Resolve collection before storing
-    resolved_collection = collection or (self._default_collection if kind == "data_type" else None)
+    # `_configured_default_collection`, not `_default_collection`: this value
+    # is persisted and read back through `_physical_collection`. See T715.
+    resolved_collection = collection or (
+        self._configured_default_collection if kind == "data_type" else None)
     self._get_conn().execute(
         "INSERT OR REPLACE INTO taxonomy (name, kind, collection, description, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -753,7 +757,11 @@ def register_taxonomy(self, name: str, kind: str = "data_type",
         # 2026-09-14 round 1 bundle04 (F7) / 2026-09-15 round 2 bundle05 (F1).
         # T651.
         self._config.setdefault("collections", {})
-        self._config["collections"][name] = collection or self._default_collection
+        # Configured spelling on both arms — a caller-supplied `collection`
+        # already is one, and the default has to be the unrewritten copy
+        # (T715); `self._default_collection` is physical by this point.
+        self._config["collections"][name] = (
+            collection or self._configured_default_collection)
         self._sync_config_to_file()
 
     logger.info("Taxonomy registered: %s (%s)", name, kind)
@@ -911,8 +919,33 @@ def unregister_taxonomy(self, name: str, kind: str = None) -> dict:
     # 2026-08-24 audit, M5.
     if deleted_kind == "data_type":
         self._collection_map.pop(name, None)
-        self._config["collections"] = dict(self._collection_map)
-        self._sync_config_to_file()
+        # Persist the removal against the CONFIGURED map, never by copying the
+        # live one. `_collection_map` holds *physical* names — model-suffixed
+        # once `_init_qdrant` has probed the embedder — and
+        # `self._config["collections"] = dict(self._collection_map)` wrote all
+        # of them, so removing one data_type rewrote every other entry into a
+        # spelling that re-suffixes on the next embedder change:
+        #
+        #     "hlmtest_memories_qwen3-embedding_8b_4096"
+        #       -> "..._qwen3-embedding_8b_4096_nomic-embed_v2_768"
+        #
+        # a collection that exists nowhere, which is the whole failure T651
+        # fixed on `register_taxonomy` — the twin thirty lines up, which since
+        # 0.8.71 writes one configured name into a dict it does not replace.
+        # The fix landed on the branch where it was noticed; this is the
+        # other one, and the class check is what should have caught it then.
+        # Driven 2026-09-26: before `unregister_taxonomy("PROBE")` the file
+        # held six configured names, after it held six suffixed ones.
+        #
+        # Nothing is written when the key is absent: absent means "use the
+        # defaults", the taxonomy row itself is already gone, and
+        # `_load_runtime_config` rebuilds the map from `kind='data_type'`
+        # rows — so there is no removal left to record.
+        # 0.8.113, T714. 2026-09-26 review round, bundle03 F2.
+        _persisted = self._config.get("collections")
+        if isinstance(_persisted, dict) and name in _persisted:
+            _persisted.pop(name, None)
+            self._sync_config_to_file()
 
     logger.info("Taxonomy unregistered: %s", name)
     return {"status": "unregistered", "name": name}
@@ -1797,7 +1830,7 @@ def _enrich_background(self, uuid: str, content: str, summary: str = None, sourc
                         try:
                             self._get_conn().execute(
                                 "UPDATE memories SET topic = COALESCE(topic, ?), "
-                                "keywords = CASE WHEN keywords IS NULL OR keywords IN ('', '[]', 'null') "
+                                "keywords = CASE WHEN " + SQL_KEYWORDS_MISSING + " "
                                 "THEN ? ELSE keywords END, updated_at = ? WHERE uuid = ?",
                                 (enriched.get("topic"),
                                  json.dumps(enriched.get("keywords", [])),
@@ -3095,6 +3128,17 @@ def backup(self, dest_dir: Optional[str] = None) -> dict:
 def list(self, topic: str = None, scope: str = None,
          limit: int = 20, sort: str = "created_at",
          include_superseded: bool = False) -> List[Dict[str, Any]]:
+    # The last two SQL-bound filters outside the shared refusal. `T710` took
+    # `retrieve`'s six through `require_str_filters`, joining `delete_many`,
+    # `graph_health` and `get_taxonomy`; `list`'s pair was missed because the
+    # enumeration that found the class walks *action arguments* and `list`
+    # reaches SQL through this backend method rather than a door-side filter
+    # dict. Same consequence as every other member: an int binds cleanly,
+    # matches nothing, and returns `[]` — which the caller cannot tell from
+    # "nothing matched" — while a list raises `sqlite3.ProgrammingError` out
+    # of the interpreter rather than as a refusal naming the field.
+    # 0.8.113, T720. 2026-09-26 review round, bundle05 F1.
+    require_str_filters(topic=topic, scope=scope)
     # Clamp: a negative limit is "unbounded" to SQLite's LIMIT, and an
     # unbounded caller-supplied value could dump the whole table in one call.
     try:
@@ -3157,16 +3201,51 @@ def test_cleanup(self) -> dict:
     drift signal on the plugin's own authoritative health line, which is the
     kind that sends someone hunting for data loss that never happened.
     """
+    # `COALESCE(protected, 0) = 0`, the third member of a class found in one
+    # review round: `review` (T709), `compact` (T711), and this. The rule the
+    # comment on sleep()'s TTL arm states is that every *automatic* maintenance
+    # path honours the do-not-touch marker, and the line docs/reference.md
+    # draws is whether the caller named the record — this one names a content
+    # marker, the way compact names a threshold, so it is on the guarded side.
+    #
+    # **Guarded and counted, not merely guarded.** A bare guard here would be
+    # worse than the hole: cleanup exists so an e2e run leaves no residue, and
+    # a protected `[HLM-TEST]` row silently skipped is residue that the next
+    # run's health line reports as drift, with nothing naming the cause.
+    # `delete_many` already solved this shape — it refuses protected rows and
+    # reports `protected_skipped` — so this returns the same field and the log
+    # line says what to do about it.
+    #
+    # The exposure is narrow, because a row must literally begin with the
+    # marker to be swept at all. The precedent is not: `T667` is the case
+    # where a content-keyed sweep met rows that were genuine *and* fixture,
+    # and its rule is to assert the precondition that makes the filter safe
+    # rather than assume it. `protected` is that assertion, made by the
+    # operator rather than inferred.
+    # 0.8.113, T719. 2026-09-26 review round, bundle05 F3.
     rows = self._get_conn().execute(
-        "SELECT uuid, data_type FROM memories WHERE status='active' AND content LIKE ?",
+        "SELECT uuid, data_type FROM memories WHERE status='active' "
+        "AND content LIKE ? AND COALESCE(protected, 0) = 0",
         (HLM_TEST_MARKER + "%",)
     ).fetchall()
+    protected_skipped = self._get_conn().execute(
+        "SELECT COUNT(*) FROM memories WHERE status='active' "
+        "AND content LIKE ? AND COALESCE(protected, 0) = 1",
+        (HLM_TEST_MARKER + "%",)
+    ).fetchone()[0]
+    if protected_skipped:
+        logger.warning(
+            "test_cleanup: %d [HLM-TEST] record(s) carry protected=1 and were "
+            "NOT swept — they will read as residue on the next run; clear the "
+            "flag or delete them by uuid", protected_skipped)
     if not rows:
         logger.info("test_cleanup: soft-deleted 0 test records")
-        return {"test_deleted": 0, "marker": HLM_TEST_MARKER}
+        return {"test_deleted": 0, "marker": HLM_TEST_MARKER,
+                "protected_skipped": protected_skipped}
 
     cur = self._get_conn().execute(
-        "UPDATE memories SET status='deleted', updated_at=? WHERE status='active' AND content LIKE ?",
+        "UPDATE memories SET status='deleted', updated_at=? WHERE status='active' "
+        "AND content LIKE ? AND COALESCE(protected, 0) = 0",
         (self._now(), HLM_TEST_MARKER + "%")
     )
     deleted = cur.rowcount
@@ -3203,7 +3282,8 @@ def test_cleanup(self) -> dict:
     logger.info("test_cleanup: soft-deleted %d test records, removed %d vector(s)",
                 deleted, removed)
     return {"test_deleted": deleted, "marker": HLM_TEST_MARKER,
-            "vectors_removed": removed}
+            "vectors_removed": removed,
+            "protected_skipped": protected_skipped}
 
 
 def delete_many(self, content_like: str = None, data_type: str = None,
@@ -3323,13 +3403,30 @@ def delete_many(self, content_like: str = None, data_type: str = None,
         raise ValueError(f"max_delete must be > 0, got {max_delete}")
 
     where = "status='active' AND " + " AND ".join(filters)
+    # `source` is selected only so the sample below can be fenced. It is a
+    # trust label, and without it this read has no way to ask the question.
     rows = self._get_conn().execute(
-        f"SELECT uuid, data_type, protected, substr(content,1,60) FROM memories "
-        f"WHERE {where}", params).fetchall()
+        f"SELECT uuid, data_type, protected, substr(content,1,60), source "
+        f"FROM memories WHERE {where}", params).fetchall()
 
     protected = [r for r in rows if r[2]]
     targets = [r for r in rows if not r[2]]
-    sample = [{"uuid": r[0], "content": r[3]} for r in targets[:5]]
+    # The sample carries stored content out to the model, so it is fenced like
+    # every other read of it. It was not, on either door: the backend built the
+    # dict, the plugin returned it verbatim and MCP `json.dumps`-ed it, and a
+    # row written by `obsidian_ingest` came back with its imperative bare while
+    # the *same row* read through `list` in the same process came back fenced.
+    # Fencing here rather than at the two doors because the doors do not have
+    # `source` — and because this is the third time (after `T642` and `T651`)
+    # a fix applied at one door was re-found missing at the other.
+    #
+    # Truncate-then-fence is the right order: `_wrap_untrusted_text` strips a
+    # complete delimiter from the payload, and a tag the `substr` cut in half
+    # is no longer a tag. Fencing first would put the marker outside the 60
+    # characters and truncate it away again.
+    # 0.8.113, T712. 2026-09-26 review round, bundle03 F1.
+    sample = [{"uuid": r[0], "content": _wrap_untrusted_text(r[3], r[4])}
+              for r in targets[:5]]
 
     if len(targets) > max_delete:
         return {"status": "refused", "matched": len(targets),

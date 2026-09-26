@@ -663,9 +663,13 @@ def sync_check(self) -> dict:
     # self._qdrant` meant the one situation that produces these records — an
     # outage — could also be the situation that reports zero of them.
     try:
+        # Both shapes of "no usable embedding": SQL NULL (legacy rows, explicit
+        # clears) and the TEXT sentinel the write path stores when the embedder
+        # fails. This counted only the first, so the diagnostic reported 0 for
+        # exactly the rows it exists to find. See `SQL_EMBEDDING_MISSING`.
         null_embedding = self._get_conn().execute(
             "SELECT COUNT(*) FROM memories "
-            "WHERE status='active' AND embedding IS NULL").fetchone()[0]
+            "WHERE status='active' AND " + _C.SQL_EMBEDDING_MISSING).fetchone()[0]
     except Exception as e:
         logger.debug("sync_check: null-embedding audit skipped: %s", e)
         null_embedding = 0
@@ -872,7 +876,11 @@ def sleep(self, max_items: int = 100, min_age_hours: float = 24.0, archive_age_d
     #
     # `COALESCE(protected, 0) = 0` on BOTH statements. `protected` is an
     # explicit do-not-touch marker and every other archival path honours it —
-    # the duplicate branch below, the low-trust branch below that, and decay().
+    # the duplicate branch below, the low-trust branch below that, decay(),
+    # and, since 0.8.113, compact()'s seed scan and both `review` doors. This
+    # enumeration is the thing a reader checks a new sweep against, so it is
+    # kept complete: compact() was missing for the whole life of this comment
+    # and the comment is how that was eventually noticed (T709, T711).
     # This one did not, so a record carrying *both* `protected=true` and a
     # `ttl` (both first-class add()/update() parameters) was archived the
     # moment its ttl passed, vanished from every read path, and was then hard
@@ -1223,8 +1231,25 @@ def find_duplicate_groups(self, similarity_threshold, topic=None, max_groups=50)
     # merges. Merging a superseded record with its own successor resurrects the
     # value the chain was built to hide, then soft-deletes both originals and
     # destroys the chain.
+    # `COALESCE(protected, 0) = 0`, for the reason sleep()'s TTL arm states at
+    # the top of this file: `protected` is an explicit do-not-touch marker and
+    # every *automatic* maintenance path honours it. That comment enumerates
+    # the paths — sleep()'s three branches and decay() — and compaction was
+    # not among them, so this was the last bulk-retirement scan without the
+    # guard. Driven before the fix: two near-duplicate records, one written
+    # with `protected=true`, seeded one group and `compact(execute=true)` set
+    # `status='deleted'` on BOTH, folding the pinned record's content into a
+    # new uuid that merely inherits the flag (`merged_protected`). The user's
+    # record is gone and a model's paraphrase of it carries the marker. It is
+    # the guarded side of the contract in docs/reference.md: compact names a
+    # threshold and a group cap, never a uuid, so no caller "said so directly".
+    # Guarding the seed scan covers membership as well as seeding — a Qdrant
+    # hit only joins a group when its uuid is in this result set.
+    # 0.8.113, T711; found one round after T709 fixed the same class in
+    # `review`, by the reviewer that had just been shown that fix.
     sql = ("SELECT uuid, data_type, source FROM memories "
-           "WHERE status='active' AND superseded_by IS NULL AND priority < 2")
+           "WHERE status='active' AND superseded_by IS NULL AND priority < 2 "
+           "AND COALESCE(protected, 0) = 0")
     if topic:
         sql += " AND topic=?"
         params.append(topic)
@@ -2267,6 +2292,32 @@ def import_memories(self, data: str, mode: str = "skip_existing",
             if not uuid:
                 results["failed"] += 1
                 results["errors"].append("Record missing uuid")
+                continue
+            # Shape, not just presence. This field is interpolated into both
+            # LLM review prompts **outside** the untrusted fence, so a uuid
+            # carrying newlines and instruction text is attacker-controlled
+            # prose in a prompt whose output can delete records. Driven
+            # 2026-09-26: a record whose uuid was a fake prompt block imported
+            # cleanly and was stored verbatim. `_llm_merge` already sanitised
+            # this column for the same reason; the review renderers did not
+            # (`T708`, which guards them).
+            #
+            # `is_storable_uuid`, **not** `is_record_uuid`. This door first
+            # shipped with the strict form and that was a regression: import
+            # is a portability path that accepts ids minted elsewhere, and
+            # demanding canonical UUID form here failed every record whose id
+            # merely looked foreign. Eight tests said so — an import fails the
+            # bad row and commits the rest, and `t640-0000-...` is data. The
+            # attack needs a prompt *block*: newlines and instructions. So
+            # this rejects control characters and unbounded length, and the
+            # renderers keep the strict check, which is where the
+            # interpolation is. `T722`.
+            if not _C.is_storable_uuid(uuid):
+                results["failed"] += 1
+                results["errors"].append(
+                    "Record uuid is not storable (must be a single-line "
+                    "string of at most 200 characters): %r"
+                    % (str(uuid)[:40],))
                 continue
 
             rec_content = rec.get("content") or ""

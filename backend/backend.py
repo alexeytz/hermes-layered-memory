@@ -96,6 +96,18 @@ class LayeredBackend:
         self._db_path = db_path
         self._qdrant_url = qdrant_url
         self._default_collection = qdrant_collection
+        # The same name, kept in its *configured* spelling and never rewritten.
+        # `_init_qdrant` rewrites `_default_collection` in place to the
+        # model-keyed physical name (`index.py`, `_physical_collection`), which
+        # is right for routing and wrong for the three paths that *persist* it:
+        # the `taxonomy.collection` column, `_config["collections"]`, and the
+        # JSON file behind it. Every reader re-keys what it loads through
+        # `_physical_collection`, so a stored physical name double-suffixes the
+        # moment the embedder changes and points at a collection that exists
+        # nowhere — `T651`'s failure, which was fixed for the branch that
+        # copied the whole map and left the default path writing the same value
+        # one line further on. 0.8.113, T715.
+        self._configured_default_collection = qdrant_collection
         self._embedding_model = embedding_model
         self._layer0_top_k = layer0_top_k
         self._profile_name = profile_name

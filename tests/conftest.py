@@ -43,6 +43,34 @@ _TEST_LOG_DIR = tempfile.mkdtemp(prefix="hlm-test-logs-")
 os.environ["HLM_LOG_FILE"] = os.path.join(_TEST_LOG_DIR, "tests.log")
 atexit.register(lambda: shutil.rmtree(_TEST_LOG_DIR, ignore_errors=True))
 
+# And redirect $HERMES_HOME for the same reason, one file over. Every
+# `LayeredBackend` construction ends up in `_ensure_db_config_defaults()` ->
+# `_save_db_config()` -> `_sync_config_to_file()`, which writes
+# `$HERMES_HOME/hermes-layered-memory.json` — layer 2 of the three-layer
+# config, the one *real* profiles read at startup. So the suite was writing
+# its own config into the operator's live file, and what it wrote included
+# the routing table:
+#
+#     ~/.hermes/hermes-layered-memory.json.bak.20260926T053648
+#     {"collections": {"SYSTEM": "hlmtest_memories", "USER-DATA":
+#      "hlmtest_memories", ..., "OBSIDIAN": "hlmtest_vault"}, ...}
+#
+# `hlmtest_*` is this suite's Qdrant namespace and exists for the reason the
+# AGENTS.md note gives — the suite must not write into live profile data. The
+# leak put the test namespace where every profile would read it as its own
+# routing table, which is that same mistake arriving by the other door. It
+# also rewrote the file (keeping 3 timestamped backups) on any machine that
+# ran the suite, whether or not a test touched config.
+#
+# One test already did this for itself (the `T353`-era HERMES_HOME dance in
+# test_pass2_regressions.py) — applied where it was noticed, not where it was
+# needed, which is the same shape as `T642` and `T651`. It belongs here, with
+# the log redirect it is a sibling of.
+# 0.8.113, T716. Found 2026-09-26 while driving bundle03 F2.
+_TEST_HERMES_HOME = tempfile.mkdtemp(prefix="hlm-test-hermes-home-")
+os.environ["HERMES_HOME"] = _TEST_HERMES_HOME
+atexit.register(lambda: shutil.rmtree(_TEST_HERMES_HOME, ignore_errors=True))
+
 # ingest_obsidian() only accepts vault_path under an allowed root (real home
 # by default) to prevent a caller reading arbitrary directories — see
 # backend/maintenance.py's _obsidian_allowed_roots(). Obsidian-ingest tests

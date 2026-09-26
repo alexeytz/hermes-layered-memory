@@ -61,6 +61,28 @@ curl -s http://localhost:6333/   # verify: returns version info
 
 Data persists in `./qdrant-data/` (bind mount). Ports: 6333 (HTTP), 6334 (gRPC).
 
+> **The container writes that directory as root**, so the user who ran
+> `docker compose up` cannot delete it afterwards without `sudo` — verified on
+> a clean Ubuntu 24.04 install, 2026-09-25, where the whole install otherwise
+> needs no root at all. The bind mount is kept deliberately (your vectors stay
+> visible and backup-able on the host), so to remove it, borrow the container's
+> own root rather than reaching for sudo:
+>
+> ```bash
+> docker compose down
+> docker run --rm -v "$PWD/qdrant-data:/data" alpine sh -c 'find /data -mindepth 1 -delete'
+> rmdir qdrant-data
+> ```
+>
+> `find -mindepth 1 -delete` rather than `rm -rf /data/*`, because Qdrant keeps
+> a `.deleted` directory and the glob does not match dotfiles — the first
+> version of this recipe left it behind and `rmdir` refused. Tested on the
+> clean host, 2026-09-25.
+>
+> Losing that directory is recoverable in any case: SQLite is the source of
+> truth, and HLM rebuilds the index on the next session when it finds the two
+> out of step (`initialize: Qdrant stale — rebuilding`).
+
 **No Docker on this host?** Skip this step and run SQLite-only: put
 `HLM_QDRANT_ENABLED=false` in the `.env` you create in step 4 (it is already
 there, commented out). HLM works without Qdrant — retrieval falls back to a
