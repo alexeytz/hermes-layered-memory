@@ -14,7 +14,6 @@ import re
 import sqlite3
 
 import builtins as _builtins
-import sys as _sys
 from typing import Any, Dict, List, Optional
 
 from .constants import (EXTRACTION_HOOKS, HLM_TEST_MARKER, HISTORY_MAX_SIZE,
@@ -24,8 +23,6 @@ from .constants import (EXTRACTION_HOOKS, HLM_TEST_MARKER, HISTORY_MAX_SIZE,
                         _validate_config_value)
 from datetime import datetime, timedelta, timezone
 
-import array
-import collections
 import contextlib
 import os
 import threading
@@ -34,6 +31,7 @@ import uuid as uuid_mod
 
 
 from .core import (
+    _valid_timestamp,
     MAX_CONTENT_CHARS,
     MAX_METADATA_CHARS,
     MAX_FIELD_CHARS,
@@ -1067,6 +1065,92 @@ def _normalise_ttl(value, now_iso: str):
     return parsed.isoformat()
 
 
+_UNSET = object()
+
+def _coerce_record_fields(keywords=_UNSET, backlinks=_UNSET, trust_score=_UNSET,
+                          sensitivity=_UNSET, priority=_UNSET) -> dict:
+    """Validate and normalise the typed fields the write paths share.
+
+    **One definition, because `add()` had grown one guard per field** — each
+    after a defect: a string in a numeric column, an out-of-range `priority`
+    that poisons Layer 1's sort, a `backlinks` dict whose *keys* got stored as
+    the caller's data. `import_memories` re-validated the same fields
+    separately, and `CHANGELOG.md` records four defects there, every one of
+    them "import checks what `add()` already enforces, and the fix patched one
+    member".
+
+    **The two callers differ in disposition, and that is deliberate.** `add()`
+    raises: one interactive write, whose caller can fix the value. Import
+    *clamps* the numerics — `T397` pins `sensitivity`, `priority` and
+    `trust_score` landing as 0, 3 and 1.0 for a record carrying junk — because
+    a bulk restore that drops a row over one bad field loses data the operator
+    asked to get back. So import passes only `keywords` and `backlinks` here
+    and keeps its own clamp for the rest; routing the numerics through this
+    function made it refuse them, and `T397` caught that.
+
+    What import was genuinely missing is the `backlinks` **elements** check:
+    its container guard accepts any list, so `[1, 2]` was stored while `add()`
+    refused it — the same container-only-check defect `add()` itself carried on
+    that field until the laguna-s-2.1 write review.
+
+    Raises `ValueError` with the message `add()` has always raised. Returns
+    only the keys it was given, normalised: numerics coerced, and
+    `keywords`/`backlinks` parsed where a JSON string arrived.
+
+    `_UNSET` rather than `None` as the default, because `None` is a legitimate
+    value meaning "leave it alone", and this must tell "not passed" from
+    "passed as null". `T705`.
+    """
+    out = {}
+
+    if keywords is not _UNSET and keywords is not None:
+        if isinstance(keywords, str):
+            try:
+                keywords = json.loads(keywords)
+            except (json.JSONDecodeError, TypeError):
+                keywords = None
+        if not isinstance(keywords, _builtins.list) or not all(
+                isinstance(k, str) for k in keywords):
+            raise ValueError(
+                f"keywords must be a list of strings (or a JSON-array string "
+                f"of strings), got {keywords!r}")
+        out["keywords"] = keywords
+
+    if backlinks is not _UNSET and backlinks is not None:
+        if isinstance(backlinks, str):
+            try:
+                backlinks = json.loads(backlinks)
+            except (json.JSONDecodeError, TypeError):
+                backlinks = []
+        if (not isinstance(backlinks, _builtins.list)
+                or not all(isinstance(b, str) for b in backlinks)):
+            raise ValueError(
+                f"backlinks must be a list of strings (or a JSON-array string "
+                f"of strings), got {backlinks!r}")
+        out["backlinks"] = backlinks
+
+    if trust_score is not _UNSET and trust_score is not None:
+        try:
+            out["trust_score"] = max(0.0, min(1.0, float(trust_score)))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"invalid trust_score {trust_score!r} — must be a number 0.0-1.0")
+
+    for _field, _lo, _hi, _val in (("sensitivity", 0, 3, sensitivity),
+                                   ("priority", 0, 3, priority)):
+        if _val is _UNSET or _val is None:
+            continue
+        try:
+            _coerced = int(_val)
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid {_field} {_val!r} — must be an integer")
+        if not (_lo <= _coerced <= _hi):
+            raise ValueError(f"invalid {_field} {_coerced} — must be {_lo}-{_hi}")
+        out[_field] = _coerced
+
+    return out
+
+
 def _check_scalar_field_bounds(session_name=None, scope=None, source_url=None):
     """Bound the caller-supplied scalars nothing bounded at all.
 
@@ -1197,17 +1281,20 @@ def add(self, content: str, summary: str = None, topic: str = None,
     # sat after it, where the dict had already been coerced into a valid list
     # of strings, so the guard could never fire. The regression suite caught
     # that; the individual fix did not, because it was only ever run pre-fix.
-    if keywords is not None:
-        if isinstance(keywords, str):
-            try:
-                keywords = json.loads(keywords)
-            except (json.JSONDecodeError, TypeError):
-                keywords = None
-        if not isinstance(keywords, _builtins.list) or not all(
-                isinstance(k, str) for k in keywords):
-            raise ValueError(
-                f"keywords must be a list of strings (or a JSON-array string "
-                f"of strings), got {keywords!r}")
+    # Every typed field this and the import path share, validated in one
+    # place (`_coerce_record_fields`) rather than per-field per-door. Here
+    # rather than lower down because this is before the embedder round trip
+    # and both Qdrant dedup queries — the rule this file already states for
+    # the payload bound, now applied to the numerics too, which used to be
+    # checked after that work.
+    _coerced = _coerce_record_fields(
+        keywords=keywords, backlinks=backlinks, trust_score=trust_score,
+        sensitivity=sensitivity, priority=priority)
+    keywords = _coerced.get("keywords", keywords)
+    backlinks = _coerced.get("backlinks", backlinks)
+    trust_score = _coerced.get("trust_score", trust_score)
+    sensitivity = _coerced.get("sensitivity", sensitivity)
+    priority = _coerced.get("priority", priority)
 
     # Moved above the payload bound (and therefore above the embedder HTTP call
     # and both Qdrant dedup queries) because every malformed-keywords add used
@@ -1281,12 +1368,7 @@ def add(self, content: str, summary: str = None, topic: str = None,
     # takes. Layer 2 multiplies trust into its score, so a string there raises
     # mid-fusion on every later retrieval that returns the row, and an
     # out-of-range value silently outranks everything else.
-    if trust_score is not None:
-        try:
-            trust_score = max(0.0, min(1.0, float(trust_score)))
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"invalid trust_score {trust_score!r} — must be a number 0.0-1.0")
+    # trust_score, sensitivity and priority: see _coerce_record_fields above.
 
     # Same rule, and the same reasoning, extended to the two fields update()
     # already validates and add() did not: a non-integer sensitivity or
@@ -1300,20 +1382,6 @@ def add(self, content: str, summary: str = None, topic: str = None,
     # int-keyed multiplier table defaults to 0.0, which decay() treats as
     # "pinned, skip"). A crash is the least of it — the quiet failure makes
     # the record immortal.
-    for _int_field, _lo, _hi, _val in (
-            ("sensitivity", 0, 3, sensitivity), ("priority", 0, 3, priority)):
-        if _val is None:
-            continue
-        try:
-            _coerced = int(_val)
-        except (TypeError, ValueError):
-            raise ValueError(f"invalid {_int_field} {_val!r} — must be an integer")
-        if not (_lo <= _coerced <= _hi):
-            raise ValueError(f"invalid {_int_field} {_coerced} — must be {_lo}-{_hi}")
-        if _int_field == "sensitivity":
-            sensitivity = _coerced
-        else:
-            priority = _coerced
 
     # Embed FIRST (cheap), then heuristic classify, then dedup, then enrich (LLM call — expensive)
     # This saves tokens when adding near-duplicates.
@@ -1452,30 +1520,13 @@ def add(self, content: str, summary: str = None, topic: str = None,
     # feature that never met: every record in every profile reported
     # `backlinks: []` while five records carried their links one level down in
     # an untyped dict.
-    if isinstance(backlinks, str):
-        try:
-            backlinks = json.loads(backlinks)
-        except (json.JSONDecodeError, TypeError):
-            backlinks = []
-    # The same guard `keywords` carries, for the same reason and one field
-    # over. `[str(b) for b in backlinks]` iterates a dict's *keys*, so
-    # add(backlinks={"a": 1}) silently stored ["a"] — not the caller's data,
-    # and no error. That is the identical defect fixed for keywords, on the
-    # neighbouring field, which is the shape this review loop keeps finding.
-    # 2026-08-23 profile-a write review (F5).
-    if backlinks is not None and (
-            not isinstance(backlinks, _builtins.list)
-            or not all(isinstance(b, str) for b in backlinks)):
-        # Elements as well as the container — `keywords` beside it checks both,
-        # and 0.7.86 added this guard with only the container half while
-        # copying the "must be a list of strings" wording verbatim. So the
-        # error message promised what the check never verified, and
-        # `backlinks=[1, 2, 3]` was silently coerced to ["1", "2", "3"] by the
-        # `[str(b) for b in backlinks]` below: the caller's data, changed, with
-        # no error. 2026-08-23 laguna-s-2.1 write review.
-        raise ValueError(
-            "backlinks must be a list of strings (or a JSON-array string), "
-            "got %r" % (backlinks,))
+    # backlinks parsing and the list-of-strings guard live in
+    # `_coerce_record_fields` above — one definition shared with the
+    # import path, which accepted `[1, 2]` until 0.8.109. The defects
+    # that earned each half are recorded there: a dict whose *keys* got
+    # stored as the caller's data (2026-08-23 profile-a write F5), and a
+    # container-only check whose message promised element validation it
+    # never did (2026-08-23 laguna-s-2.1 write review).
     bl_json = json.dumps([str(b) for b in backlinks]) if backlinks else "[]"
 
     # Write to SQLite with retry on lock. Only the INSERT+supersession+commit

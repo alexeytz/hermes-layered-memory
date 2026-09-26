@@ -1,5 +1,17 @@
 
 code_review_findings*.md
+# A review report dropped at the root is that round's *input* — scratch,
+# like the findings files above. Its output is the verdicts file under
+# docs/review-archive/<date>/, which is tracked. 0.8.104 committed this
+# one by accident and caught it before the push.
+/REVIEW.md
+
+# The snapshot's push message, written into the built tree by
+# scripts/build-public-tree.py on every build. It travels with the files
+# to whichever host does the GitHub push; it is not part of the
+# distribution, and this line is published verbatim so a `git add -A` in
+# the public clone cannot commit it either.
+/github-commit.txt
 *.db
 dispatch-results.json
 e2e.log

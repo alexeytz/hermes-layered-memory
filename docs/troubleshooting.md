@@ -405,7 +405,7 @@ If mismatched, update `backend/constants.py` to the desired version and regenera
 Full reference — every suite, flag, requirement and isolation guarantee: `docs/testing.md` (development repository).
 
 ```bash
-# Run full regression suite (~7-18 min — background it)
+# Run full regression suite (~7-20 min — background it)
 cd hermes-layered-memory
 docker compose up -d
 python3 tests/run-regression.py

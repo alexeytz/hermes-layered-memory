@@ -14,8 +14,6 @@ import sqlite3
 import os
 import pwd
 
-import builtins as _builtins
-import sys as _sys
 from typing import Any, Dict, List, Optional
 
 from .constants import HEURISTIC_MAP, DEFAULT_WEIGHTS, CONFLICT_THRESHOLDS_DEFAULT
@@ -25,7 +23,6 @@ import collections
 import time
 import math
 import re
-import uuid as uuid_mod
 
 
 from . import constants as _C
@@ -791,8 +788,7 @@ def _layer1(self, candidates: List[tuple], query: str,
             continue
         conn = None
         try:
-            import sqlite3 as _sqlite3
-            conn = _sqlite3.connect(db_path, check_same_thread=False)
+            conn = sqlite3.connect(db_path, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
             # Apply the supersession filter only where the column exists.
@@ -1759,8 +1755,7 @@ def list_profiles(self) -> List[dict]:
         info = {"profile": name, "db_path": db_path, "is_current": is_current}
         if os.path.exists(db_path):
             try:
-                import sqlite3 as _sqlite3
-                conn = _sqlite3.connect(db_path, check_same_thread=False)
+                conn = sqlite3.connect(db_path, check_same_thread=False)
                 try:
                     # Active record count (exclude superseded records, matching count())
                     cols = [r[1] for r in conn.execute("PRAGMA table_info(memories)").fetchall()]
@@ -1804,7 +1799,7 @@ def list_profiles(self) -> List[dict]:
                         elif sum_path.startswith("~"):
                             sum_path = sum_path.replace("~", _real_home, 1)
                         if os.path.exists(sum_path):
-                            sum_conn = _sqlite3.connect(sum_path, check_same_thread=False)
+                            sum_conn = sqlite3.connect(sum_path, check_same_thread=False)
                             try:
                                 # Scope the count to this profile. The
                                 # summaries DB is shared but carries a

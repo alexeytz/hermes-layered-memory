@@ -189,7 +189,7 @@ hermes -p <profile> plugins disable hermes-layered-memory
 ## Testing
 
 ```bash
-# Run full regression suite (~7-18 min — background it)
+# Run full regression suite (~7-20 min — background it)
 python3 tests/run-regression.py
 
 # Run dispatch-layer tests (37 tests, ~15s)
@@ -270,3 +270,7 @@ See [docs/mcp.md](docs/mcp.md) for standalone usage and the full multi-agent des
 **Mandatory:** code changes require corresponding test updates. Run `python3 tests/run-regression.py && python3 tests/test_dispatch.py` before committing.
 
 `docs/architecture.md` covers the pipeline and data model, and `docs/reference.md` the full tool and config surface.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Alexey T.

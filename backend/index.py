@@ -13,15 +13,11 @@ import json
 import sqlite3
 import os
 
-import builtins as _builtins
-import sys as _sys
-from typing import Any, Dict, List, Optional
-from datetime import datetime, timedelta, timezone
+from typing import Any, List, Optional
 
 import collections
 import time
 import re
-import uuid as uuid_mod
 
 
 from . import constants as _C
@@ -39,7 +35,6 @@ from .core import (
     _unpack_embedding,
     logger,
     _norm_data_id,
-    _wrap_untrusted_text,
 )
 
 
@@ -297,15 +292,7 @@ def _check_duplicate(self, embedding: List[float], data_type: str, threshold: fl
     qdrant_answered = False
     try:
         coll = self._get_collection(data_type or "CUSTOM")
-        from qdrant_client.models import Filter, FieldCondition, MatchValue as MatchValueQ
-        scroll_filter = Filter(must=[])
-        if data_type:
-            scroll_filter.must.append(
-                FieldCondition(key="data_type", match=MatchValueQ(value=data_type)))
-        if self._profile_name:
-            scroll_filter.must.append(
-                FieldCondition(key="profile_name", match=MatchValueQ(value=self._profile_name))
-            )
+        scroll_filter = _profile_scroll_filter(self._profile_name, data_type)
 
         resp = self._qdrant.query_points(
             collection_name=coll,
@@ -616,15 +603,7 @@ def _check_contradiction(self, embedding: List[float], data_type: str,
 
     try:
         coll = self._get_collection(data_type or "CUSTOM")
-        from qdrant_client.models import Filter, FieldCondition, MatchValue as MatchValueQ
-        scroll_filter = Filter(must=[])
-        if data_type:
-            scroll_filter.must.append(
-                FieldCondition(key="data_type", match=MatchValueQ(value=data_type)))
-        if self._profile_name:
-            scroll_filter.must.append(
-                FieldCondition(key="profile_name", match=MatchValueQ(value=self._profile_name))
-            )
+        scroll_filter = _profile_scroll_filter(self._profile_name, data_type)
 
         # Search for similar vectors (use top 5 for broader check)
         resp = self._qdrant.query_points(
@@ -725,7 +704,28 @@ def _check_contradiction(self, embedding: List[float], data_type: str,
         return None
 
 
-def _embed_batch(self, texts: List[str], batch_size: int = 64) -> List[Optional[List[float]]]:
+def _profile_scroll_filter(profile_name: Optional[str], data_type: Optional[str]):
+    """The `data_type` + `profile_name` Qdrant filter both vector readers use.
+
+    Built twice, identically, in this file — `_layer0`'s search and the dedup
+    check. A filter-shape change (a new partition key, a vault scope, a
+    tightened profile predicate) had to be made in both, and the review
+    protocol's class check exists because that is exactly how one of two
+    copies gets fixed. 2026-09-24 external review A5.1.
+    """
+    from qdrant_client.models import Filter, FieldCondition, MatchValue as MatchValueQ
+    scroll_filter = Filter(must=[])
+    if data_type:
+        scroll_filter.must.append(
+            FieldCondition(key="data_type", match=MatchValueQ(value=data_type)))
+    if profile_name:
+        scroll_filter.must.append(
+            FieldCondition(key="profile_name", match=MatchValueQ(value=profile_name)))
+    return scroll_filter
+
+
+def _embed_batch(self, texts: List[str],
+                 batch_size: int = _C.EMBED_BATCH_SIZE) -> List[Optional[List[float]]]:
     """Embed many texts with one request per `batch_size`, order preserved.
 
     Falls back to per-text embedding for a batch that fails, so one bad
@@ -1114,8 +1114,7 @@ def _fallback_uuids(self, data_type: str = None,
         if not db_path or not os.path.exists(db_path):
             continue
         try:
-            import sqlite3 as _sqlite3
-            conn = _sqlite3.connect(db_path, check_same_thread=False)
+            conn = sqlite3.connect(db_path, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
             where = "SELECT uuid FROM memories WHERE status='active'"
@@ -1462,8 +1461,7 @@ def _fts5_fallback(self, query: str, scope: str = None,
             continue
         conn = None
         try:
-            import sqlite3 as _sqlite3
-            conn = _sqlite3.connect(db_path, check_same_thread=False)
+            conn = sqlite3.connect(db_path, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
             db_where = where

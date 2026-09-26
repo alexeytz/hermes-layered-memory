@@ -13158,3 +13158,301 @@ def test_t680():
         "behind every vector hit and only _layer2's BM25 term can lift them. "
         "A record with no vector becomes unretrievable at the default limit.\n  "
         + "\n  ".join(problems))
+
+
+def test_t699():
+    """One bad record must not cost a rebuild the other sixty-three.
+
+    `rebuild()` re-embeds every record whose vector is NULL or the wrong
+    dimension — it is the repair path for a broken index. It batched that work
+    itself: 64 contents to the raw embedding function inside one try/except,
+    with the failure handler logging a warning and moving on. So a single
+    record the embedder choked on **abandoned its whole batch**, and rebuild
+    went on to report success having silently skipped the records it exists to
+    repair. On a 758-record profile that is up to 64 rows lost per bad one,
+    and nothing in the result says so.
+
+    `_embed_batch()` had been written for exactly this and was used everywhere
+    else in the file. It falls back to per-text embedding when a batch raises,
+    retries a null entry the embedder returned *without* raising, and rejects
+    a response whose length does not match the request — which the inline copy
+    needed too, since it zipped uuids against whatever came back.
+
+    This drives the case the inline version lost: three records to re-embed,
+    an embedder that refuses one of them. Two must come back with vectors.
+    Against the pre-fix tree all three stay NULL.
+
+    2026-09-24 external review A5.3, verified and fixed 0.8.104.
+    """
+    import backend.index as _idx
+
+    be = _make_backend("t699")
+    try:
+        texts = [
+            "Rebuild batch guard: the first record of the three.",
+            "Rebuild batch guard: the poisoned record the embedder refuses.",
+            "Rebuild batch guard: the third record of the three.",
+        ]
+        uuids = [_get_uuid(be.add(content=t, data_type="ENV-DATA", source="agent"))
+                 for t in texts]
+        assert all(uuids), "fixture writes failed"
+
+        # Blank the vectors so all three enter rebuild's re-embed queue.
+        conn = be._get_conn()
+        conn.execute("UPDATE memories SET embedding = NULL WHERE uuid IN (?,?,?)", uuids)
+        conn.commit()
+        blanked = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE embedding IS NULL AND uuid IN (?,?,?)",
+            uuids).fetchone()[0]
+        assert blanked == 3, f"precondition: expected 3 NULL embeddings, got {blanked}"
+
+        real = _idx._get_embedding_fn(be._embedding_model)
+        poison = texts[1]
+
+        def selective(*_a, **_k):
+            def fn(batch):
+                if poison in batch:
+                    raise RuntimeError("embedder refused this text")
+                return real(batch)
+            return fn
+
+        # Patch every module that holds its own binding. `from .core import
+        # _get_embedding_fn` binds at import time, so patching one module does
+        # not reach another — the first version of this test patched `index`
+        # only, and against the pre-fix tree (which called the function from
+        # `maintenance`'s namespace) the real embedder ran, all three records
+        # succeeded, and the test "failed" on its own precondition rather than
+        # on the defect. A false kill is worth no more than a false pass.
+        import backend.maintenance as _maint
+        targets = [m for m in (_idx, _maint) if hasattr(m, "_get_embedding_fn")]
+        assert targets, "no module exposes _get_embedding_fn; the patch reaches nothing"
+        saved = [(m, m._get_embedding_fn) for m in targets]
+        for m, _ in saved:
+            m._get_embedding_fn = selective
+        try:
+            be.rebuild()
+        finally:
+            for m, fn_orig in saved:
+                m._get_embedding_fn = fn_orig
+
+        rows = dict(be._get_conn().execute(
+            "SELECT uuid, embedding IS NOT NULL FROM memories WHERE uuid IN (?,?,?)",
+            uuids).fetchall())
+        recovered = [u for u in (uuids[0], uuids[2]) if rows.get(u)]
+
+        assert len(recovered) == 2, (
+            "rebuild lost the healthy records to their batch-mate: "
+            f"{len(recovered)} of 2 re-embedded. The batch is embedded through "
+            "_embed_batch precisely so one refusal falls back to per-text "
+            "instead of abandoning everything alongside it.")
+        assert not rows.get(uuids[1]), (
+            "the poisoned record came back with a vector — the fixture did not "
+            "reproduce the failure it is testing")
+    finally:
+        _cleanup_qdrant_coll(be); be.close(); _cleanup_db("t699")
+
+
+def test_t704():
+    """Every caller-controlled timestamp cutoff is comparable before it reaches SQL.
+
+    Three actions take a timestamp from the caller and put it straight into a
+    string comparison against ISO text: `rebuild(since=)`,
+    `enrich_existing(since=)` and `delete_many(created_before=)`. SQLite
+    compares them as text, so an unparseable value fails in whichever
+    direction its first character falls. Measured on this schema, three rows
+    at 2026-09-01/-20/-25 and `updated_at > ?`:
+
+        since='2026-09-19T00:00:00Z'  -> 2 rows   (as intended)
+        since='not-a-date'            -> 0 rows   (silent no-op)
+        since='12345'                 -> 3 rows   (cutoff ignored entirely)
+
+    `rebuild` has refused this since 0.8.x. The other two had not:
+
+    * **`enrich_existing(since=)` had no guard at all.** `'not-a-date'` made it
+      report a completed run having classified nothing; `'12345'` made it
+      enrich the entire store at the LLM budget's expense. Found by a
+      structure-scoped review, 2026-09-25 — its point being that the tangle in
+      those handlers is per-action validation threaded by hand, so a member
+      gets missed rather than a chokepoint being wrong.
+    * **`delete_many(created_before=)` had the guard written and unreachable.**
+      `store.py` called `_valid_timestamp` without importing it, so *every*
+      value raised `NameError` — including valid ones, which meant the filter
+      had never worked at all. Found by the class check on the finding above,
+      the way `T641` fell out of `T640`'s fix rather than out of a review.
+
+    So this drives both halves for all three. The **valid** case is the one
+    that matters: a guard that refuses everything looks identical to a guard
+    that works, until someone passes a real timestamp.
+
+    `_valid_timestamp` now lives in `backend/core.py`, which imports no method
+    module and is therefore the one place all three callers can reach it.
+    """
+    be = _make_backend("t704")
+    try:
+        cases = [
+            ("rebuild", lambda v: be.rebuild(since=v), "since"),
+            ("enrich_existing", lambda v: be.enrich_existing(since=v), "since"),
+            ("delete_many",
+             lambda v: be.delete_many(created_before=v, execute=False),
+             "created_before"),
+        ]
+        for name, call, param in cases:
+            for bad in ("not-a-date", "12345", "9"):
+                try:
+                    call(bad)
+                except ValueError as exc:
+                    assert param in str(exc), (
+                        f"{name}({param}={bad!r}) raised a ValueError that does "
+                        f"not name the parameter: {exc}")
+                except Exception as exc:  # NameError, ProgrammingError, ...
+                    raise AssertionError(
+                        f"{name}({param}={bad!r}) raised {type(exc).__name__} "
+                        f"rather than a ValueError explaining the refusal: "
+                        f"{exc}. An unparseable cutoff must be refused at the "
+                        f"door, not turned into a crash or a silent no-op") from None
+                else:
+                    raise AssertionError(
+                        f"{name}({param}={bad!r}) was accepted. It reaches a "
+                        f"string comparison against ISO text: depending on its "
+                        f"first character it selects nothing (a run that "
+                        f"reports success and does nothing) or everything")
+
+            # And the half that caught delete_many's NameError.
+            try:
+                call("2026-09-01T00:00:00Z")
+            except ValueError as exc:
+                raise AssertionError(
+                    f"{name}({param}=<a valid ISO timestamp>) was refused: "
+                    f"{exc}. A guard that rejects valid input is "
+                    f"indistinguishable from one that works until someone "
+                    f"tries it") from None
+            except Exception as exc:
+                raise AssertionError(
+                    f"{name}({param}=<a valid ISO timestamp>) raised "
+                    f"{type(exc).__name__}: {exc}. This is how "
+                    f"delete_many(created_before=) shipped — the guard's own "
+                    f"call site could not resolve the validator, so the filter "
+                    f"never ran for any value") from None
+    finally:
+        _cleanup_qdrant_coll(be); be.close(); _cleanup_db("t704")
+
+
+def test_t705():
+    """Neither door stores a value the other would refuse — disposition may differ.
+
+    **The claim this test had to be rewritten around.** A first pass measured
+    `add()` against `import` by asking *was the record accepted*, and reported
+    five divergences: `trust_score='high'`, `sensitivity=9`, `sensitivity='secret'`,
+    `priority=-1`, `backlinks=[1, 2]` — refused by `add()`, accepted by import.
+    Four of those five were not defects. `T397` pins that import **clamps** the
+    numerics on purpose: that record lands as `(sensitivity 0, priority 3,
+    trust_score 1.0)`, all valid. Acceptance was never the question; what
+    reaches the column is.
+
+    The reason the two differ is stated in `T397`'s docstring and is sound. A
+    bulk restore that drops a record over one junk field loses data the
+    operator asked to get back, so import clamps into range; `add()` is a
+    single interactive write whose caller can fix the value, so it raises.
+
+    **What was genuinely missing is `backlinks` elements.** Import's container
+    guard (2026-08-25 bundle02 F2) accepts any list, so `[1, 2]` was stored
+    while `add()` refused it — the same container-only-check defect `add()`
+    itself carried on that field until the laguna-s-2.1 write review. One
+    member of the class, still open after four fixes.
+
+    So this asserts the invariant that actually holds across both doors:
+    **whatever the disposition, the stored row is valid.** Refusing and
+    clamping both satisfy it; storing `[1, 2]` in `backlinks` or TEXT in
+    `sensitivity` does not.
+
+    `_coerce_record_fields` in `store.py` holds the rules both use.
+    """
+    import os as _os
+    import pwd as _pwd
+    import shutil as _shutil
+    import tempfile as _tempfile
+    import uuid as _uuid
+
+    # Import refuses paths outside HLM_IMPORT_ALLOWED_ROOTS before reading a
+    # field, so a probe writing to /tmp measures the containment gate and
+    # nothing else — the first version of this one did exactly that, and every
+    # row "agreed" for a reason unrelated to the question.
+    home = _pwd.getpwuid(_os.getuid()).pw_dir
+    workdir = _tempfile.mkdtemp(dir=home, prefix=".hlm-t705-")
+
+    be = _make_backend("t705")
+
+    def _import_one(extra, tag):
+        rec = {"uuid": str(_uuid.uuid4()), "content": f"t705 {tag}",
+               "data_type": "CUSTOM", "created_at": "2026-09-01T00:00:00Z",
+               "updated_at": "2026-09-01T00:00:00Z"}
+        rec.update(extra)
+        path = _os.path.join(workdir, f"{tag}.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"records": [rec]}, fh)
+        return rec["uuid"], be.import_memories(path)
+
+    try:
+        _, control = _import_one({}, "control")
+        assert control.get("imported") == 1, (
+            f"the control record did not import ({control}); every case below "
+            f"would then 'agree' by failing for one unrelated reason")
+
+        # 1. add() refuses these outright.
+        for i, (field, value) in enumerate(
+                [("backlinks", [1, 2]), ("keywords", {"a": 1}),
+                 ("trust_score", "high"), ("sensitivity", "secret")]):
+            try:
+                be.add(content=f"t705 add {field} {i}", source="agent", **{field: value})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"add({field}={value!r}) was accepted")
+
+        # 2. import must never *store* one of them. Refusing the row and
+        #    clamping the value both qualify; keeping it does not.
+        for i, (field, value, column) in enumerate(
+                [("backlinks", [1, 2], "backlinks"),
+                 ("keywords", {"a": 1}, "keywords"),
+                 ("trust_score", "high", "trust_score"),
+                 ("sensitivity", 9, "sensitivity"),
+                 ("priority", -1, "priority")]):
+            uid, res = _import_one({field: value}, f"bad-{field}-{i}")
+            if not res.get("imported"):
+                continue                      # refused outright — fine
+            row = be._get_conn().execute(
+                f"SELECT {column} FROM memories WHERE uuid = ?", (uid,)).fetchone()
+            stored = row[0] if row else None
+            if column in ("sensitivity", "priority"):
+                assert isinstance(stored, int) and 0 <= stored <= 3, (
+                    f"import stored {column}={stored!r} from {value!r}. SQLite "
+                    f"sorts TEXT above every integer, so sleep()'s archive "
+                    f"filter and find_duplicate_groups' seed scan skip the row "
+                    f"forever — it becomes immortal, quietly")
+            elif column == "trust_score":
+                assert isinstance(stored, (int, float)) and 0.0 <= stored <= 1.0, (
+                    f"import stored trust_score={stored!r} from {value!r}. "
+                    f"Layer 2 multiplies it into the score, so a non-number "
+                    f"raises mid-fusion on every later retrieval returning it")
+            else:
+                parsed = json.loads(stored) if isinstance(stored, str) else stored
+                assert isinstance(parsed, list) and all(
+                    isinstance(x, str) for x in parsed), (
+                    f"import stored {column}={stored!r} from {value!r}; "
+                    f"add() refuses it, and every reader treats these as "
+                    f"strings — the container was checked and the elements "
+                    f"were not, which is the defect add() had on this very "
+                    f"field")
+
+        # 3. And valid values still go in, on both doors — a validator that
+        #    refuses everything looks exactly like one that works (T704).
+        for i, (field, value) in enumerate(
+                [("trust_score", 0.5), ("sensitivity", 2), ("priority", 1),
+                 ("backlinks", ["note-a"]), ("keywords", ["k1", "k2"])]):
+            be.add(content=f"t705 ok {field} {i}", source="agent", **{field: value})
+            _, res = _import_one({field: value}, f"ok-{field}-{i}")
+            assert res.get("imported") == 1, (
+                f"import refused {field}={value!r}, which add() accepts: {res}")
+    finally:
+        _shutil.rmtree(workdir, ignore_errors=True)
+        _cleanup_qdrant_coll(be); be.close(); _cleanup_db("t705")

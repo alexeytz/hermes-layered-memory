@@ -20,14 +20,12 @@ import collections
 import json
 import logging
 import os
-import pwd
 import re
 import sqlite3
+from datetime import datetime
 import sys as _sys
 import time
-import uuid as uuid_mod
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import List, Optional
 
 # Retry wrapper for SQLite write operations (handles concurrent Hermes sessions)
 def _is_lock_error(e: Exception) -> bool:
@@ -759,6 +757,33 @@ def _suffix_enabled() -> bool:
 #: type. Below it the guess is advisory and the record keeps CUSTOM.
 HEURISTIC_CONFIDENCE_MIN = 0.6
 
+
+
+def _valid_timestamp(value) -> bool:
+    """Is this an ISO-8601 timestamp we would have written ourselves?
+
+    Deliberately strict: `datetime.fromisoformat` accepts a lot, but anything
+    it rejects is not a timestamp, and the fields this guards are compared as
+    *strings* in SQL cutoffs and interpolated into an LLM prompt. A value that
+    is neither is a value some other code will treat as one.
+    2026-08-24 audit, M1.
+
+    **Here rather than in `maintenance.py`, since 0.8.108.** Three
+    caller-controlled cutoffs need it — `rebuild(since=)`,
+    `enrich_existing(since=)` and `delete_many(created_before=)` — living in
+    three modules, and it was defined in one of them. `store.py` called it
+    without importing it, so `delete_many(created_before=...)` raised
+    `NameError` for *every* value including valid ones, and the filter had
+    never worked; `llm.py` never called it at all. `core.py` imports no method
+    module, which is what makes it the one place all three can reach.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return True
+    except (TypeError, ValueError):
+        return False
 
 def _resolve_data_type(data_type, h_type, confidence) -> str:
     """The single rule deciding a record's `data_type`.

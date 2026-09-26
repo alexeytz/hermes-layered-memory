@@ -12,23 +12,19 @@ from __future__ import annotations
 import json
 import sqlite3
 
-import builtins as _builtins
-import sys as _sys
-from typing import Any, Dict, List, Optional
-from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 
-import glob
 import os
 import pwd
 import re
 import threading
 import time
-import uuid as uuid_mod
 from urllib.parse import urlparse
 
 
 from . import constants as _C
 from .core import (
+    _valid_timestamp,
     HEURISTIC_CONFIDENCE_MIN,
     logger,
     _resolve_data_type,
@@ -530,7 +526,26 @@ def enrich_existing(self, since: str = None, max_items: int = _C.ENRICH_MAX_ITEM
     Pass 1: Records with empty topic/keywords (any data_type).
     Pass 2: data_type='CUSTOM' records (low-confidence heuristic leftover).
     Uses single LLM call per pass (all records at once) for speed.
+
+    `since` reaches `WHERE updated_at > ?` verbatim at both passes, and
+    `updated_at` holds ISO text, so an unparseable string is compared as a
+    string and fails in whichever direction its first character falls —
+    measured on this schema: `"not-a-date"` sorts above every timestamp and
+    selects **nothing**, so the run reports success having classified nothing,
+    while `"12345"` sorts below every timestamp and selects **everything**,
+    spending the LLM budget on the whole store. The same knob on the same
+    column in `rebuild()` has refused this since 0.8.x; this member was missed,
+    and `delete_many(created_before=)` had the guard written but unreachable.
+    `_valid_timestamp` is a shared primitive in `core.py` for that reason.
+    2026-09-25 structure review; `T704`.
     """
+    if since and not _valid_timestamp(since):
+        raise ValueError(
+            f"since must be a valid ISO timestamp, got {since!r} — an "
+            f"unparseable string compares as text against ISO timestamps in "
+            f"SQLite: depending on its first character it selects no rows (a "
+            f"run that reports success and enriches nothing) or every row (the "
+            f"whole store, at the LLM budget's expense)")
     enriched = 0
     now = self._now()
 

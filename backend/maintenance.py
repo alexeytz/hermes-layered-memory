@@ -12,9 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-import builtins as _builtins
-import sys as _sys
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 
 import collections
@@ -34,8 +32,8 @@ from .core import (
     _SELF_AUTHORED_SOURCES,
     _conflict_partners,
     _from_qdrant_id,
-    _get_embedding_fn,
     _pack_embedding,
+    _valid_timestamp,
     _retry_on_lock,
     _setting,
     _to_qdrant_id,
@@ -124,7 +122,6 @@ def rebuild(self, since: str = None) -> dict:
             f"unparseable string compares unpredictably against ISO text in "
             f"SQLite: it can match every row (a silent full rebuild) or none "
             f"(a rebuild that reports success and repairs nothing)")
-    fn = _get_embedding_fn(self._embedding_model)
     where = "status = 'active'"
     params = []
     if since:
@@ -154,11 +151,18 @@ def rebuild(self, since: str = None) -> dict:
         except Exception as e:
             logger.warning("rebuild: dimension check failed for uuid=%s: %s", uuid[:8] if isinstance(uuid, str) else uuid, e)
 
-    # Phase 2: batch re-embed in groups of 64
-    EMBED_BATCH = 64
+    # Phase 2: batch re-embed, through `_embed_batch` rather than a second
+    # implementation of it. This loop used to call the raw embedding function
+    # inside one try/except, so **a single bad record abandoned all 64** — and
+    # rebuild went on to report success, having silently skipped the records
+    # it exists to repair. `_embed_batch` falls back to per-text embedding for
+    # a failed batch, retries a null entry the embedder returned without
+    # raising, and refuses a response whose length does not match the request
+    # (this loop zipped uuids against whatever came back). 2026-09-24 external
+    # review A5.3; `T699`.
     reembed_map = {}  # uuid → embedding
-    for i in range(0, len(reembed_queue), EMBED_BATCH):
-        batch = reembed_queue[i:i + EMBED_BATCH]
+    for i in range(0, len(reembed_queue), _C.EMBED_BATCH_SIZE):
+        batch = reembed_queue[i:i + _C.EMBED_BATCH_SIZE]
         contents = []
         batch_uuids = []
         for uuid, coll in batch:
@@ -170,7 +174,7 @@ def rebuild(self, since: str = None) -> dict:
                 batch_uuids.append(uuid)
         if contents:
             try:
-                embeddings = fn(contents)
+                embeddings = self._embed_batch(contents)
                 for uuid, emb in zip(batch_uuids, embeddings):
                     if emb:
                         reembed_map[uuid] = emb
@@ -453,8 +457,6 @@ def resolve_conflicts(self, execute: bool = False) -> dict:
     action exists to prevent. Rows written before the change still carry a
     bare string, which _conflict_partners reads.
     """
-    from collections import defaultdict
-
     # Find all conflict-flagged records. `source` is carried through to the
     # dry-run preview below — without it the caller has no way to fence the
     # content snippet, and this action defaults to dry-run, so every first
@@ -508,7 +510,7 @@ def resolve_conflicts(self, execute: bool = False) -> dict:
             if p in parent:
                 _union(u, p)
 
-    groups = defaultdict(list)
+    groups = collections.defaultdict(list)
     for u, rec in by_uuid.items():
         groups[_find(u)].append(rec)
 
@@ -1605,24 +1607,6 @@ def _parse_timestamp(value):
     return dt.astimezone(timezone.utc)
 
 
-def _valid_timestamp(value) -> bool:
-    """Is this an ISO-8601 timestamp we would have written ourselves?
-
-    Deliberately strict: `datetime.fromisoformat` accepts a lot, but anything
-    it rejects is not a timestamp, and the fields this guards are compared as
-    *strings* in SQL cutoffs and interpolated into an LLM prompt. A value that
-    is neither is a value some other code will treat as one.
-    2026-08-24 audit, M1.
-    """
-    if not isinstance(value, str) or not value.strip():
-        return False
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return True
-    except (TypeError, ValueError):
-        return False
-
-
 def _non_negative_age(value, label):
     """Ages are durations, so a negative one inverts the guard it computes.
 
@@ -1909,8 +1893,7 @@ def export_memories(self, fmt: str = "json",
     )
 
     def _query_one(db_path, prof):
-        import sqlite3 as _sqlite3
-        conn = _sqlite3.connect(db_path, check_same_thread=False)
+        conn = sqlite3.connect(db_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         try:
@@ -2119,6 +2102,23 @@ def _clamp_sensitivity(value) -> int:
         return max(0, min(3, int(value)))
     except (TypeError, ValueError):
         return 0
+
+
+def _import_json_fields(rec: dict) -> tuple:
+    """`(keywords_json, metadata_json)` for an imported row, defaults on junk.
+
+    Written out twice inside the import path — once on the UPDATE branch and
+    once on the INSERT branch — with the same `isinstance` checks and the same
+    `"[]"`/`"{}"` fallbacks. Two copies of a coercion rule on the door that
+    `CHANGELOG.md` records four separate defects for, every one of them "the
+    import path validates per-field what `add()` already enforces, and the fix
+    patched one member". 2026-09-24 external review A5.2.
+    """
+    kw = rec.get("keywords", [])
+    kw_json = json.dumps(kw) if isinstance(kw, list) else "[]"
+    meta = rec.get("metadata", {})
+    meta_json = json.dumps(meta) if isinstance(meta, dict) else "{}"
+    return kw_json, meta_json
 
 
 def import_memories(self, data: str, mode: str = "skip_existing",
@@ -2391,22 +2391,33 @@ def import_memories(self, data: str, mode: str = "skip_existing",
                 results["errors"].append(_bad_container)
                 continue
 
-            _kw = rec.get("keywords")
-            if _kw is not None:
-                if isinstance(_kw, str):
-                    try:
-                        _kw = json.loads(_kw)
-                    except (json.JSONDecodeError, TypeError):
-                        _kw = None
-                if not isinstance(_kw, _builtins.list) or not all(
-                        isinstance(k, str) for k in _kw):
-                    results["failed"] += 1
-                    results["errors"].append(
-                        f"Record {uuid} keywords must be a list of strings "
-                        f"(or a JSON-array string of strings), got "
-                        f"{rec.get('keywords')!r}")
-                    continue
-                rec["keywords"] = _kw
+            # `keywords` and `backlinks` through the same rules `add()` uses.
+            #
+            # **Only those two.** The numerics differ here *by design*: `T397`
+            # pins that import **clamps** `sensitivity`, `priority` and
+            # `trust_score` — writing 0, 3 and 1.0 for the record that test
+            # imports — rather than dropping the row, because a bulk restore
+            # that discards a record over one junk field loses data the
+            # operator asked to get back. `add()` raises instead, for a single
+            # interactive write whose caller can fix it. Two dispositions, one
+            # rule set; passing the numerics through here made import *refuse*
+            # them, and `T397` caught it.
+            #
+            # What was genuinely missing is the `backlinks` **elements** check.
+            # The container guard above (2026-08-25 bundle02 F2) accepts any
+            # list, so `backlinks=[1, 2]` was stored while `add()` refused it —
+            # the identical container-only-check defect `add()` itself carried
+            # on the same field, found by the laguna-s-2.1 write review.
+            from .store import _coerce_record_fields, _UNSET
+            try:
+                _norm = _coerce_record_fields(
+                    keywords=rec.get("keywords", _UNSET),
+                    backlinks=rec.get("backlinks", _UNSET))
+            except ValueError as _e:
+                results["failed"] += 1
+                results["errors"].append(f"Record {uuid} {_e}")
+                continue
+            rec.update(_norm)
 
             try:
                 from .store import (_check_fts_field_bounds,
@@ -2456,16 +2467,7 @@ def import_memories(self, data: str, mode: str = "skip_existing",
                             results["errors"].append(
                                 f"Record {uuid} has empty content — cannot overwrite with blank")
                             continue
-                        kw = rec.get("keywords", [])
-                        if isinstance(kw, list):
-                            kw_json = json.dumps(kw)
-                        else:
-                            kw_json = "[]"
-                        meta = rec.get("metadata", {})
-                        if isinstance(meta, dict):
-                            meta_json = json.dumps(meta)
-                        else:
-                            meta_json = "{}"
+                        kw_json, meta_json = _import_json_fields(rec)
                         # backlinks/layer3_flags — see the matching comment
                         # on the INSERT branch below. Neither existed in this
                         # branch before 0.7.55; an overwrite import silently
@@ -2549,17 +2551,7 @@ def import_memories(self, data: str, mode: str = "skip_existing",
                 continue
 
             # Build keyword JSON
-            kw = rec.get("keywords", [])
-            if isinstance(kw, list):
-                kw_json = json.dumps(kw)
-            else:
-                kw_json = "[]"
-
-            meta = rec.get("metadata", {})
-            if isinstance(meta, dict):
-                meta_json = json.dumps(meta)
-            else:
-                meta_json = "{}"
+            kw_json, meta_json = _import_json_fields(rec)
 
             # backlinks/layer3_flags/reference_count were absent from this
             # INSERT entirely (backlinks, layer3_flags) or bound to a literal

@@ -2656,8 +2656,8 @@ memory_config = _tool_modules.config_tools.register(mcp, _CTX)
 
 SEARXNG_URL = os.environ.get("HLM_SEARXNG_URL")
 if SEARXNG_URL:
-    from urllib.parse import quote  # noqa: E402
     from urllib.request import urlopen, Request  # noqa: E402
+    from urllib.parse import quote  # noqa: E402
 
     async def _searxng_search(query: str, max_results: int = 5, categories: str = "general") -> str:
         """Search the web via SearXNG and return results."""
