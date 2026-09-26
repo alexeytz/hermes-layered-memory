@@ -12,7 +12,7 @@ import pwd
 from typing import Optional
 
 # ── Version (single source of truth) ──────────────────────────────────────
-__version__ = "0.8.113"
+__version__ = "0.8.114"
 
 
 def str_filter_error(label: str, value: object) -> Optional[str]:
