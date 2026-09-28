@@ -99,6 +99,26 @@ def machine_checks() -> bool:
         except Exception as e:
             good &= _say(BAD, "embedder answers", f"{type(e).__name__}: {e}")
 
+    # The packages, in the interpreter that will run the plugin. "backend
+    # imports" is not this question: the backend imports qdrant_client
+    # optionally, on purpose, so it can degrade — which is exactly why this
+    # said READY on 2026-09-28 with none of the three installed, while the
+    # plugin started with vector search disabled. Same three the suite's
+    # preflight requires. T755.
+    import importlib.util as _iu
+    missing = [m for m in ("qdrant_client", "numpy", "sentence_transformers")
+               if _iu.find_spec(m) is None]
+    good &= _say(OK if not missing else BAD, "dependencies importable",
+                 f"in {sys.executable}" if not missing else
+                 f"missing {missing} in {sys.executable} — see README step "
+                 f"'Install the Python dependencies'")
+    venv_py = os.path.expanduser("~/.hermes/hermes-agent/venv/bin/python")
+    if os.path.exists(venv_py) and os.path.realpath(sys.executable) != os.path.realpath(venv_py):
+        _say(WARN, "not the Hermes interpreter",
+             f"the plugin runs in {venv_py}; these checks describe "
+             f"{sys.executable}. Re-run with that interpreter for a verdict "
+             f"that applies to the plugin")
+
     qurl = os.environ.get("HLM_QDRANT_URL", "http://localhost:6333")
     try:
         import urllib.request

@@ -389,7 +389,9 @@ def _load_config() -> dict:
     config_path = get_hermes_home() / "hermes-layered-memory.json"
     if config_path.exists():
         try:
-            return json.loads(config_path.read_text(encoding="utf-8"))
+            # Comment-tolerant: the example this file is copied from carries
+            # `#` lines, and a documented install failed to parse (T753).
+            return _C.parse_config_text(config_path.read_text(encoding="utf-8"))
         except Exception as e:
             # A malformed config silently reverting every setting (db_path,
             # qdrant_url, max_layer, ...) to hardcoded defaults with no
@@ -1050,7 +1052,17 @@ class LayeredMemoryProvider(MemoryProvider):
             if rows:
                 logger.debug("initialize: restored %d tags from session_tags for %s", len(rows), session_id[:8])
 
-        db_path = self._config.get("db_path", f"{hermes_home}/hermes-layered-memory-dbs/{profile_name}.db")
+        # `HLM_DB_PATH` first, because the backend applies it regardless: when
+        # this computed a different default and passed it as the explicit
+        # argument, the backend's override warning — written for four real
+        # incidents where an env var silently beat an intended path — fired on
+        # *every* correctly configured profile, since the documented install
+        # sets exactly that variable. Found on the 2026-09-28 retest (F5).
+        # Passing the configured path makes the warning mean what it says.
+        # T754.
+        _env_db = backend_module._setting("HLM_DB_PATH")
+        db_path = _env_db or self._config.get(
+            "db_path", f"{hermes_home}/hermes-layered-memory-dbs/{profile_name}.db")
         db_path = db_path.replace("$HERMES_HOME", hermes_home)
         # Resolve ~ to real home (Hermes remaps $HOME)
         _real_home = real_home()

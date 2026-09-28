@@ -12,7 +12,7 @@ import pwd
 from typing import Optional
 
 # ── Version (single source of truth) ──────────────────────────────────────
-__version__ = "0.8.118"
+__version__ = "0.8.119"
 
 
 def str_filter_error(label: str, value: object) -> Optional[str]:
@@ -85,6 +85,29 @@ def check_budget(budget):
     if not (math.isfinite(value) and value > 0):
         raise ValueError(f"budget must be a positive, finite number of seconds, got {budget!r}")
     return value
+
+
+def parse_config_text(text: str) -> dict:
+    """Parse `hermes-layered-memory.json`, tolerating full-line `#` comments.
+
+    The shipped `hermes-layered-memory.example.json` opens with `#` comment
+    lines explaining itself, and `README.md` and `scripts/plan-install.py`
+    both tell a new user to `cp` it into place. `json.loads` rejects the first
+    `#`, so every documented install started with "failed to parse … — using
+    defaults" — and then `_sync_config_to_file` wrote the in-memory defaults
+    *over the file*, replacing the operator's config with
+    `{"dedup_threshold": 0.97}`. Found on the second-machine retest,
+    2026-09-28 (F4). Lines whose first non-blank character is `#` are dropped;
+    anything else must be valid JSON, and a `#` inside a string value is
+    untouched because only whole lines are removed. T753.
+    """
+    body = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    if not body.strip():
+        return {}
+    data = json.loads(body)
+    if not isinstance(data, dict):
+        raise ValueError("config must be a JSON object")
+    return data
 
 
 def real_home() -> str:
@@ -710,7 +733,7 @@ EXTRACTION_CONTRACT = (
 )
 
 __all__ = [
-    "real_home",
+    "real_home", "parse_config_text",
     "ENTITY_PATTERNS_DEFAULT", "EXTRACTION_CONTRACT",
     "KEYWORDS_EMPTY_VALUES", "SQL_KEYWORDS_MISSING",
     "EXTRACTION_HOOKS", "SELF_AUTHORED_SOURCES", "UNTRUSTED_OPEN", "UNTRUSTED_CLOSE",

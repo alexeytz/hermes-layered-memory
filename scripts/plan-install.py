@@ -169,6 +169,13 @@ def render(a):
     print(f"        {prof_dir}/plugins/hermes-layered-memory")
     print("   Symlink, not a copy: a copy drifts and nothing in the repo notices.")
 
+    step("Install the Python dependencies into the Hermes venv.")
+    print("   The plugin runs inside Hermes' own interpreter, so that is where they")
+    print("   go — not the system python3. Without them HLM still starts, but with")
+    print("   vector search disabled and only a log line to say so (2026-09-28).")
+    print("     ~/.hermes/hermes-agent/venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu")
+    print("     ~/.hermes/hermes-agent/venv/bin/pip install qdrant-client numpy sentence-transformers")
+
     if a["qdrant"] == "docker":
         step("Start Qdrant.")
         print(f"     cd {ROOT} && docker compose up -d && sleep 3")
@@ -211,13 +218,15 @@ def render(a):
         print("   collection changes with the model, so run")
         print("   layered_maintenance(action=\"rebuild\") after switching.")
 
-    step("Verify, before trusting it.")
-    print("     python3 scripts/check-environment.py")
+    step("Verify, before trusting it — with the venv's interpreter.")
+    print("     ~/.hermes/hermes-agent/venv/bin/python scripts/check-environment.py")
     if a["embed"] == "remote":
         print(f"     # export HLM_EMBED_URL / HLM_EMBED_MODEL in the shell first —")
         print(f"     # the check reads the environment, not the profile's .env.")
-    print("   Then, for the full suite (~7-18 min, background it):")
-    print("     python3 tests/run-regression.py")
+    print("   Then, for the full suite (~7-20 min, background it):")
+    print("     ~/.hermes/hermes-agent/venv/bin/python tests/run-regression.py")
+    print("   The system python3 has none of the dependencies and the suite's own")
+    print("   preflight refuses to start under it.")
 
     step("Start a session.")
     print(f"     hermes -p {p} chat -q \"remember that the deploy host is host-01\"")

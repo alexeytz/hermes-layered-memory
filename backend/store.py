@@ -20,7 +20,7 @@ from .constants import (EXTRACTION_HOOKS, HLM_TEST_MARKER, HISTORY_MAX_SIZE,
                         HISTORY_ROTATE_KEEP, VALID_DATA_TYPES,
                         SQL_KEYWORDS_MISSING,
                         UPDATE_ALLOWED_FIELDS,
-                        is_taxonomy_name, require_str_filters,
+                        is_taxonomy_name, parse_config_text, require_str_filters,
                         _validate_config_value)
 from datetime import datetime, timedelta, timezone
 
@@ -495,6 +495,21 @@ def _sync_config_to_file(self) -> None:
     try:
         from hermes_constants import get_hermes_home
         config_path = get_hermes_home() / "hermes-layered-memory.json"
+        if config_path.exists():
+            # Never overwrite a file this process could not read. The merged
+            # view was built without it — a failed parse leaves `_config` at
+            # defaults — so writing it back replaced the operator's config
+            # with a near-empty dict, keeping only a rotating backup. On the
+            # 2026-09-28 retest that was the first thing a documented install
+            # did (F4). Refuse, say why, and leave the file for a human. T753.
+            try:
+                parse_config_text(config_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(
+                    "Config sync skipped: %s does not parse (%s) — not "
+                    "overwriting a file this process could not read. Fix it "
+                    "and the next config write will sync.", config_path, e)
+                return
         # Backup existing file before overwriting — keep only the last 3
         if config_path.exists():
             # UTC, like every other stamp here. A local-time filename sorts

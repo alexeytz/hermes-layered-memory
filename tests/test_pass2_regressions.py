@@ -15457,3 +15457,108 @@ def test_t748():
     assert not offenders, (
         "creates a .hermes/profiles directory without _isolated_profiles_home:\n  "
         + "\n  ".join(offenders))
+
+
+def test_t753():
+    """The config file is parsed comment-tolerantly and never overwritten when it cannot be.
+
+    The shipped `hermes-layered-memory.example.json` opens with `#` comment
+    lines, and `README.md` and `plan-install.py` both say to `cp` it into
+    place. On the 2026-09-28 second-machine retest the first session logged
+    "failed to parse … — using defaults", and `_sync_config_to_file` then wrote
+    the in-memory defaults over the file: the operator's config became
+    `{"dedup_threshold": 0.97}`, with only a rotating backup left. Two fixes,
+    both asserted: `parse_config_text` drops full-line `#` comments (a `#` in a
+    value survives), and the sync refuses to overwrite a file that does not
+    parse.
+    """
+    from backend.constants import parse_config_text
+    import tempfile
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    example = open(os.path.join(root, "hermes-layered-memory.example.json"),
+                   encoding="utf-8").read()
+    assert example.lstrip().startswith("#"), (
+        "fixture: the example no longer opens with comments — this test would "
+        "no longer exercise the documented copy")
+    cfg = parse_config_text(example)
+    assert isinstance(cfg, dict) and cfg.get("collections"), (
+        f"the shipped example does not parse as the documented config: {cfg!r}")
+    assert parse_config_text('# c\n{"a": "x # not a comment"}') == {"a": "x # not a comment"}
+    assert parse_config_text("# only comments\n") == {}
+    for bad in ("{not json", "[1, 2]"):
+        try:
+            parse_config_text(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"parse_config_text accepted {bad!r}")
+
+    home = tempfile.mkdtemp(prefix="t753-home-")
+    prev = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = home
+    path = os.path.join(home, "hermes-layered-memory.json")
+    be = _make_backend("t753")
+    try:
+        broken = '{"max_layer": 3, oops'
+        open(path, "w").write(broken)
+        be._sync_config_to_file()
+        assert open(path).read() == broken, (
+            "the sync overwrote a config file it could not parse — the "
+            "operator's settings are gone")
+        open(path, "w").write(example)
+        be._sync_config_to_file()
+        assert json.load(open(path)).get("collections"), (
+            "a commented but valid config must still sync normally")
+    finally:
+        _cleanup_qdrant_coll(be); be.close(); _cleanup_db("t753")
+        if prev is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = prev
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_t754():
+    """A documented install does not trip the `HLM_DB_PATH` override warning.
+
+    `LayeredBackend` warns when `HLM_DB_PATH` overrides an explicitly passed
+    `db_path` — deliberately, after four incidents where an env var silently
+    beat an intended path. The plugin computed its own default and passed it
+    as that explicit argument, while the documented install sets
+    `HLM_DB_PATH` to a different place, so the warning fired on every correctly
+    configured profile and meant nothing. Found on the 2026-09-28 retest (F5).
+    The plugin now passes the configured path: same database, no warning.
+    """
+    import logging as _logging
+    plugin = _plugin_module()
+    env_db = _make_db_path("t754env")
+    records = []
+
+    class _H(_logging.Handler):
+        def emit(self, rec):
+            records.append(rec.getMessage())
+    h = _H()
+    from backend import logger as _lg
+    _lg.addHandler(h)
+    prev = os.environ.get("HLM_DB_PATH")
+    os.environ["HLM_DB_PATH"] = env_db
+    prov = None
+    try:
+        config = {"db_path": _make_db_path("t754cfg"), "qdrant_url": QDRANT_URL,
+                  "collections": dict(TEST_COLLECTIONS), "max_layer": 2, "enrich_llm": False}
+        prov = plugin.LayeredMemoryProvider(config=config)
+        prov.initialize(session_id="t754-session-000000000000", profile_name="test-t754",
+                        agent_identity="test-t754")
+        assert os.path.abspath(prov._backend._db_path) == os.path.abspath(env_db), (
+            f"the backend opened {prov._backend._db_path}; HLM_DB_PATH names {env_db}")
+        noisy = [m for m in records if "overrides the db_path" in m]
+        assert not noisy, f"a configured HLM_DB_PATH still logs as an override: {noisy[0]}"
+    finally:
+        _lg.removeHandler(h)
+        if prev is None:
+            os.environ.pop("HLM_DB_PATH", None)
+        else:
+            os.environ["HLM_DB_PATH"] = prev
+        if prov and prov._backend:
+            _cleanup_qdrant_coll(prov._backend); prov._backend.close()
+        _cleanup_db("t754env"); _cleanup_db("t754cfg")

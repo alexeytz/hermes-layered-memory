@@ -171,8 +171,14 @@ HLM_LOG=DEBUG
 ### 5. Verify
 
 ```bash
-python3 scripts/check-environment.py
+~/.hermes/hermes-agent/venv/bin/python scripts/check-environment.py
 ```
+
+Run it — and the suites below — with the **Hermes venv's** interpreter: that
+is where the dependencies went and what the plugin runs in. A system `python3`
+without them makes the suites' preflight refuse, and made this check say READY
+for an environment the plugin could not use (fixed in 0.8.119; it now checks
+the packages and names the interpreter).
 
 Two verdicts, deliberately separate: the repo's own invariants (the same answer
 on every machine) and this machine's readiness (embedder reachable, Qdrant
@@ -212,15 +218,15 @@ hermes -p <profile> plugins disable hermes-layered-memory
 
 ```bash
 # Run full regression suite (~7-20 min — background it)
-python3 tests/run-regression.py
+~/.hermes/hermes-agent/venv/bin/python tests/run-regression.py
 
 # Run dispatch-layer tests (37 tests, ~20-30s)
-python3 tests/test_dispatch.py
+~/.hermes/hermes-agent/venv/bin/python tests/test_dispatch.py
 ```
 
 ```bash
 # Is this clone and this machine actually ready?
-python3 scripts/check-environment.py
+~/.hermes/hermes-agent/venv/bin/python scripts/check-environment.py
 ```
 
 The suite is not part of this distribution; see the development repository.
