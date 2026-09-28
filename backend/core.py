@@ -28,6 +28,34 @@ import time
 from typing import List, Optional
 
 # Retry wrapper for SQLite write operations (handles concurrent Hermes sessions)
+def connect_readonly(db_path: str, busy_timeout_ms: int = 5000) -> sqlite3.Connection:
+    """Open another profile's database, or a shared one, for reading only.
+
+    Every cross-profile reader opened its target read-write and then issued
+    `PRAGMA journal_mode=WAL` — a *write* — for a SELECT. Driven 2026-09-27: an
+    export touching a profile DB in rollback mode switched it to WAL and created
+    `-wal`/`-shm` beside it, and one that was readable but not writable
+    (`chmod 444`) dropped out of the export entirely — "attempt to write a
+    readonly database", logged at WARNING, the caller told the export
+    succeeded. A read-only open reads that same file fine. Six sites: export,
+    both lexical fallbacks, layer 1's cross-profile arm, and `list_profiles`
+    (its memories *and* summaries opens). 2026-09-26 round bundle02 F9, class
+    wider than filed. T735.
+
+    `mode=ro` through a `file:` URI with `uri=True` — `T592` exists because a
+    `file:` string without it silently creates a new empty database named
+    after the URI. The path is percent-quoted: an unquoted `?` or `#` in a
+    directory name would be read as the URI's query or fragment. A missing
+    file now raises rather than being created empty, which is the other half
+    of what read-only buys.
+    """
+    from urllib.parse import quote
+    conn = sqlite3.connect(f"file:{quote(db_path)}?mode=ro", uri=True,
+                           check_same_thread=False)
+    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+    return conn
+
+
 def _is_lock_error(e: Exception) -> bool:
     """True only for a genuine SQLite busy/locked condition.
 

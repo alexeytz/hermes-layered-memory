@@ -20,7 +20,7 @@ from .constants import (EXTRACTION_HOOKS, HLM_TEST_MARKER, HISTORY_MAX_SIZE,
                         HISTORY_ROTATE_KEEP, VALID_DATA_TYPES,
                         SQL_KEYWORDS_MISSING,
                         UPDATE_ALLOWED_FIELDS,
-                        require_str_filters,
+                        is_taxonomy_name, require_str_filters,
                         _validate_config_value)
 from datetime import datetime, timedelta, timezone
 
@@ -583,8 +583,27 @@ def delete_config(self, key: str) -> dict:
     Returns:
         dict with status
     """
-    self._get_conn().execute("DELETE FROM runtime_config WHERE key = ?", (key,))
+    cur = self._get_conn().execute("DELETE FROM runtime_config WHERE key = ?", (key,))
     self._get_conn().commit()
+    # No runtime override existed, so there is nothing for this function to
+    # remove — and the rest of it would have removed something else. The pop
+    # below takes the key out of the *merged* view and `_sync_config_to_file`
+    # then rewrites `hermes-layered-memory.json` from that view, so deleting a
+    # key the operator had written only in the file erased it from the file:
+    # `{"status": "deleted"}`, and after a restart the value was gone. Driven
+    # 2026-09-27 with `max_layer` and `collections`. The comment below already
+    # said "a value that was only ever in the file is not something this
+    # deleted"; this makes the code agree. A key that *was* overridden keeps
+    # the old behaviour: the file mirrors every `set`, so its pre-set value was
+    # already replaced when the override was written. 2026-09-26 round
+    # bundle05 F2. T742.
+    if cur.rowcount == 0:
+        if key in self._config:
+            return {"status": "not_a_runtime_override", "key": key,
+                    "note": ("nothing deleted: this key is set by the config file "
+                             "or the environment, not by the config set action. "
+                             "Change it there.")}
+        return {"status": "not_found", "key": key}
     # The DELETE removes the *stored* value; the pop used to remove whatever
     # was in the merged view, whichever layer put it there. So
     # `delete_config("max_layer")` with `HLM_MAX_LAYER` set reported
@@ -694,6 +713,15 @@ def register_taxonomy(self, name: str, kind: str = "data_type",
     """
     if kind not in ("data_type", "data_id"):
         return {"error": f"invalid kind: {kind} (must be data_type or data_id)"}
+    # Shape, not just type: a registered name becomes a valid data_type for
+    # every later write and is printed in the review prompt. The chokepoint,
+    # so both doors get it. `unregister_taxonomy` deliberately does NOT check
+    # this — it is how a bad name registered before the check is removed.
+    # T730.
+    if not is_taxonomy_name(name):
+        return {"error": (
+            f"invalid taxonomy name {name!r}: 1-64 characters, letters, digits "
+            f"and _ . : - only, starting with a letter or digit")}
 
     # Naive local time here was the same defect 0.7.40 fixed one line-number
     # away in _save_db_config: a stamp with no offset, stored beside UTC
@@ -1282,6 +1310,39 @@ def add(self, content: str, summary: str = None, topic: str = None,
         protected: bool = False, force: bool = False,
         supersedes: str = None,
         embedding: List[float] = None) -> Union[str, dict]:
+    # `supersedes` must name a record that is still the current value. A
+    # target that does not qualify used to be ignored inside the transaction —
+    # a warning in the log, a plain success to the caller — so an agent
+    # correcting a fact a second time with the uuid still in its context
+    # (already superseded by the first correction) wrote a new row that
+    # retired nothing: two current answers, and nothing else noticed, because
+    # `supersedes` also skips dedup. Driven 2026-09-27 on both doors.
+    #
+    # Not refused, and that is T151's point, kept: a bad pointer must not lose
+    # the fact being stored. The pointer is dropped and the write proceeds as
+    # an ordinary add — which runs the dedup and contradiction checks
+    # `supersedes` would have skipped, so the stale-uuid correction meets the
+    # check built for it — and the response says, in `note`, that nothing was
+    # superseded. The defect was the silence. 2026-09-26 round bundle01 F4.
+    # T737.
+    if supersedes is not None:
+        _current = isinstance(supersedes, str) and self._get_conn().execute(
+            "SELECT 1 FROM memories WHERE uuid = ? AND status = 'active' "
+            "AND superseded_by IS NULL", (supersedes,)).fetchone()
+        if not _current:
+            _args = {k: v for k, v in locals().items()
+                     if k not in ("self", "_current", "supersedes")}
+            res = add(self, supersedes=None, **_args)
+            _note = (f"supersedes={supersedes!r} is not a current record (already "
+                     f"superseded, deleted, or unknown), so nothing was superseded. "
+                     f"Retrieve the current value and supersede that.")
+            if isinstance(res, dict):
+                res = dict(res)
+                res["note"] = (res["note"] + " " + _note) if res.get("note") else _note
+                res.setdefault("supersede_ignored", supersedes)
+                return res
+            return {"uuid": res, "status": "added", "note": _note,
+                    "supersede_ignored": supersedes}
     # Reject an empty write up front. `content` is NOT NULL in the schema but
     # nothing checked it: None reached the embedder as [None] and then
     # `content[:100]` for the default summary, surfacing as an opaque
@@ -1531,6 +1592,13 @@ def add(self, content: str, summary: str = None, topic: str = None,
     data_id = enriched.get("data_id", data_id)
     topic = enriched.get("topic", topic)
     keywords = enriched.get("keywords", keywords) or []
+    # The bound runs on the caller's list, above; enrichment then appends up
+    # to 15 extracted entities on a low-confidence classification, so a
+    # caller at exactly MAX_KEYWORDS stored 215 — past the bound the FTS index
+    # is sized for. Clamp what HLM added, never refuse what the caller sent:
+    # the caller's entries come first in the list, so they survive the cut.
+    # Driven 2026-09-27 on both doors. 2026-09-26 round bundle01 F5. T739.
+    keywords = keywords[:MAX_KEYWORDS]
 
     # Normalize data_id to lowercase for consistency (SW/sw → sw, HW/hw → hw)
     if data_id:
@@ -1565,6 +1633,7 @@ def add(self, content: str, summary: str = None, topic: str = None,
     # Write to SQLite with retry on lock. Only the INSERT+supersession+commit
     # is retried (not the embedding or dedup above), so each retry is fast.
     superseded_uuid = None
+    supersede_lost = None
     for attempt in range(50):
         try:
             self._get_conn().execute("""
@@ -1596,8 +1665,10 @@ def add(self, content: str, summary: str = None, topic: str = None,
                     superseded_uuid = supersedes
                     logger.info("add: %s supersedes %s", uuid[:8], supersedes[:8])
                 else:
+                    # Only reachable by a race with the check above.
                     logger.warning("add: supersedes=%s not found or inactive — ignored",
                                str(supersedes)[:8])
+                    supersede_lost = supersedes
 
             self._get_conn().commit()
             break
@@ -1656,6 +1727,11 @@ def add(self, content: str, summary: str = None, topic: str = None,
 
     logger.info("add: uuid=%s data_type=%s data_id=%s summary=%r",
                  uuid[:8], data_type, data_id, (summary or content[:60]))
+    if supersede_lost:
+        return {"uuid": uuid, "status": "added",
+                "note": f"Stored, but supersedes={supersede_lost} was retired by a "
+                        f"concurrent write before this one committed, so nothing "
+                        f"was superseded. Retrieve the current value and check."}
     if superseded_uuid:
         return {"uuid": uuid, "status": "superseded",
                 "superseded_uuid": superseded_uuid,
@@ -2161,6 +2237,19 @@ def update(self, uuid: str, **fields):
     # heuristics only (llm=False), so this stays offline, deterministic and
     # free. An explicit keywords= in the same call wins; the caller has said
     # what it wants.
+    #
+    # "Re-derive" yields exactly what `add()` would derive for the new
+    # content — and for content the heuristic classifies with full
+    # confidence, that is *nothing*: `_enrich_metadata` returns before entity
+    # extraction on that branch. So a content-only edit of such a record
+    # stores `[]`, and any keywords the caller supplied at `add` are gone.
+    # Driven 2026-09-27 (`["gpu", "rtx3090", "vram"]` -> `[]`). That is the
+    # stated trade — stale keywords stay matchable, none cannot mismatch —
+    # but it is not "rather than clear" for that class, and a caller who
+    # wants to keep keywords across a content edit must pass them. Extracting
+    # entities on the high-confidence branch would change `add()` for every
+    # record and, since keywords are embedded, the retrieval baseline T364
+    # gates; that is a measured decision of its own, not a side-fix.
     if "content" in clean and "keywords" not in clean:
         try:
             enriched = self._enrich_metadata(
@@ -2793,55 +2882,71 @@ def write_extraction_ledger(self, entry: dict) -> None:
 
 
 def extraction_stats(self, limit: int = 200) -> dict:
-    """Summarize recent extraction runs from the history sidecar."""
+    """Summarize recent extraction runs from the history sidecar.
+
+    A ledger that does not exist yet is an empty summary: nothing has run.
+    A ledger that exists and cannot be read **raises**. This used to catch
+    every exception, log it at DEBUG and return the all-zero summary, so an
+    unreadable ledger reported "0 runs" -- a fabricated answer that reads
+    exactly like a profile where extraction never ran. Both doors already
+    handle a raise (`_do_stats` and MCP `stats` answer `"extraction": null`
+    and log at WARNING, T649/T662), but both tests replaced this function
+    with one that raises, so neither handler was reachable by a real
+    failure. Driven 2026-09-27: `chmod 000` on the ledger returned
+    `{"runs": 0, ...}`. 2026-09-27 review round, bundle04 read-and-cleared #4.
+    T724.
+    """
     summary = {"runs": 0, "candidates": 0, "stored": 0, "superseded": 0,
                "rejected": 0, "failed": 0, "last_run": None, "by_hook": {},
                "non_extraction": {}}
-    try:
-        path = self._get_history_path()
-        if not os.path.exists(path):
-            return summary
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.readlines()[-5000:]
-        runs = []
-        for line in reversed(lines):
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if rec.get("action") != "extraction":
-                continue
-            # The history sidecar is shared by every profile whose DB lives
-            # in the same directory, so entries must be filtered by profile.
-            if rec.get("profile") != (self._profile_name or "unknown"):
-                continue
-            runs.append(rec)
-            if len(runs) >= limit:
-                break
-        for rec in runs:
-            # Two writers share this ledger and only one of them writes
-            # extraction runs. `prefetch_value` carries injected/used/unused
-            # in the candidates/stored/rejected fields, so adding it in
-            # reported 89% of candidates rejected on a profile whose real
-            # extraction rejection rate was 36%. Counted separately rather
-            # than dropped: a row nobody can see is how the miscount lasted.
-            hook = rec.get("hook") or "unknown"
-            if hook not in EXTRACTION_HOOKS:
-                summary["non_extraction"][hook] = \
-                    summary["non_extraction"].get(hook, 0) + 1
-                continue
-            summary["runs"] += 1
-            summary["candidates"] += int(rec.get("candidates") or 0)
-            summary["stored"] += int(rec.get("stored") or 0)
-            summary["superseded"] += int(rec.get("superseded") or 0)
-            summary["rejected"] += int(rec.get("rejected") or 0)
-            if rec.get("reason"):
-                summary["failed"] += 1
-            summary["by_hook"][hook] = summary["by_hook"].get(hook, 0) + 1
-        if runs:
-            summary["last_run"] = runs[0].get("ts")
-    except Exception as e:
-        logger.debug("extraction stats read failed: %s", e)
+    path = self._get_history_path()
+    if not os.path.exists(path):
+        return summary
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.readlines()[-5000:]
+    runs = []
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        # A valid JSON line that is not an object is as unusable as an
+        # unparseable one. Skipped for the same reason: with the blanket
+        # except gone, one stray `[]` line would otherwise null the whole
+        # summary via AttributeError.
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("action") != "extraction":
+            continue
+        # The history sidecar is shared by every profile whose DB lives
+        # in the same directory, so entries must be filtered by profile.
+        if rec.get("profile") != (self._profile_name or "unknown"):
+            continue
+        runs.append(rec)
+        if len(runs) >= limit:
+            break
+    for rec in runs:
+        # Two writers share this ledger and only one of them writes
+        # extraction runs. `prefetch_value` carries injected/used/unused
+        # in the candidates/stored/rejected fields, so adding it in
+        # reported 89% of candidates rejected on a profile whose real
+        # extraction rejection rate was 36%. Counted separately rather
+        # than dropped: a row nobody can see is how the miscount lasted.
+        hook = rec.get("hook") or "unknown"
+        if hook not in EXTRACTION_HOOKS:
+            summary["non_extraction"][hook] = \
+                summary["non_extraction"].get(hook, 0) + 1
+            continue
+        summary["runs"] += 1
+        summary["candidates"] += int(rec.get("candidates") or 0)
+        summary["stored"] += int(rec.get("stored") or 0)
+        summary["superseded"] += int(rec.get("superseded") or 0)
+        summary["rejected"] += int(rec.get("rejected") or 0)
+        if rec.get("reason"):
+            summary["failed"] += 1
+        summary["by_hook"][hook] = summary["by_hook"].get(hook, 0) + 1
+    if runs:
+        summary["last_run"] = runs[0].get("ts")
     return summary
 
 
@@ -3516,8 +3621,22 @@ def feedback(self, uuid: str, helpful: bool) -> dict:
     Low-trust records (<0.3) are auto-archived by layered_sleep.
     """
     # Coerce string "false"/"true" to bool — LLM tool calls may send strings
+    #
+    # Three-way, not a denylist. `not in (<falsy words>)` read every other
+    # string as True, so `helpful="unhelpful"` and `"not helpful"` rewarded
+    # the record the caller meant to penalise — a persistent trust write in
+    # the wrong direction — while MCP's argument model refused the same
+    # values. Unknown spellings are refused; the accepted ones are the
+    # denylist's own plus the truthy words the MCP transport accepts, so the
+    # two doors agree. 2026-09-26 round bundle04 F4. T740.
     if isinstance(helpful, str):
-        helpful = helpful.strip().lower() not in ("false", "no", "0", "", "off", "none", "null", "nil", "f", "n")
+        _h = helpful.strip().lower()
+        if _h in ("true", "yes", "1", "on", "t", "y"):
+            helpful = True
+        elif _h in ("false", "no", "0", "", "off", "none", "null", "nil", "f", "n"):
+            helpful = False
+        else:
+            raise ValueError(f"helpful must be true or false, got {helpful!r}")
     elif not isinstance(helpful, bool):
         helpful = bool(helpful)
 

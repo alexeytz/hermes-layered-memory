@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -157,6 +158,18 @@ def _wrap_summary_fields(record: dict) -> dict:
     if record.get("metadata") not in (None, "", {}):
         record["metadata"] = _wrap_untrusted_metadata(
             record["metadata"], _UNTRUSTED_SUMMARY_SOURCE)
+    # `source_url` and `full_text`, the two fields `mcp_server._fence` wraps
+    # and this did not. `source_url` is the page's own address, supplied by
+    # the agent that read it — a URL path carries arbitrary text — and it came
+    # back raw on this door's get/list/search while the memory read paths
+    # fence the same-named field (`_FENCED_FIELDS`). Driven 2026-09-27. No
+    # plugin summary read returns `full_text` today (they hand out the .md
+    # path); it is listed so a read that starts returning it is fenced by
+    # default rather than by the next review. Found by the verifier of the
+    # 2026-09-26 backlog, unfiled. T744.
+    for _k in ("source_url", "full_text"):
+        if record.get(_k):
+            record[_k] = _wrap_untrusted(str(record[_k]), _UNTRUSTED_SUMMARY_SOURCE)
     return record
 
 
@@ -491,11 +504,11 @@ META_SUMMARIES_SCHEMA = {
             "limit": {"type": "integer", "default": 5, "description": "For list/search: maximum results to return."},
             "offset": {"type": "integer", "default": 0, "description": "For list: number of records to skip (pagination)."},
             "tag": {"type": "string", "description": "For list: filter summaries by tag."},
-            "sort_by": {"type": "string", "description": "For list: field to sort by (e.g., 'created_at', 'source_url')."},
+            "sort_by": {"type": "string", "description": "For list/search: 'created_at' or 'updated_at', newest first. list defaults to created_at; search defaults to relevance."},
             "max_age_days": {"type": "integer", "description": "For list_expiring: maximum age in days before summary expires."},
             "profile_name": {"type": "string", "description": "Profile name override."},
-            "profile": {"type": "string", "description": "For delete/sync: scope ('own' = own profile only, 'all' = any profile)."},
-            "sort": {"type": "string", "description": "Alias for sort_by."},
+            "profile": {"type": "string", "description": "For delete: scope ('own' = own profile only, 'all' = any profile). sync always re-indexes this profile only and does not read it."},
+            "sort": {"type": "string", "description": "For list/search: alias for sort_by."},
         },
     },
 }
@@ -516,13 +529,12 @@ META_ADVANCED_SCHEMA = {
             # makes the whole dict unevaluable and the tool silently vanishes
             # from docs/tools.md. T612 pins this literal to the constant
             # instead, which fails mechanically if either moves.
-            "max_items": {"type": "integer", "default": 10, "description": "For enrich/compact: maximum number of items to process. enrich applies this limit to each of its two selects independently, so a run reaches up to twice this many records."},
+            "max_items": {"type": "integer", "default": 10, "description": "For enrich: maximum number of items to process. enrich applies this limit to each of its two selects independently, so a run reaches up to twice this many records. compact does not read it — its bound is max_groups."},
             "similarity_threshold": {"type": "number", "default": 0.90, "description": "For compact: cosine similarity threshold for duplicate detection."},  # literal, pinned to _C.COMPACT_SIMILARITY_DEFAULT by T648 — see the max_items note above
             "budget": {"type": "number", "description": "For enrich/reenrich: wall-clock seconds to spend before stopping early. Unset means no deadline. The run reports paused=true when it stopped on the deadline rather than finishing."},
             "threshold": {"type": "number", "default": 0.5, "description": "For graph_health: a record whose nearest neighbour scores below this is reported as isolated. Raise it to catch loosely-connected records, lower it for only the truly stranded."},
-            "limit": {"type": "integer", "default": 200, "description": "For graph_health: how many records to scan, newest first. The comparison is quadratic, so this caps the cost; the result reports truncated=true when it did not cover everything."},
+            "limit": {"type": "integer", "description": "For graph_health/traces/reenrich: graph_health — how many records to scan, newest first (default 200); the comparison is quadratic, so this caps the cost, and the result reports truncated=true when it did not cover everything. traces — maximum results (default 10). reenrich — maximum records (default 0 = every record)."},
             "query": {"type": "string", "description": "For traces: filter traces by query string."},
-            "limit": {"type": "integer", "default": 10, "description": "For traces/reenrich: maximum number of results."},
             "topic_only": {"type": "boolean", "default": False, "description": "For reenrich: only enrich missing topics."},
             "keyword_only": {"type": "boolean", "default": False, "description": "For reenrich: only enrich missing keywords."},
             "since": {"type": "string", "description": "For enrich: only enrich records created since this ISO timestamp."},
@@ -2433,7 +2445,12 @@ class LayeredMemoryProvider(MemoryProvider):
             return tool_error("layered_memory(action='update') requires either 'uuid' or 'tag' parameter.")
         if isinstance(target_uuid, str) and not target_uuid.strip():
             return tool_error("layered_memory(action='update'): target_uuid resolved to empty string — provide a valid uuid or tag.")
-        self._mark_prefetch_used(target_uuid, reinforce=True)
+        # The reward moved below the write. It sat here, above the seen-UUID
+        # gate, the row check and validation, so a refused update — invalid
+        # sensitivity, or a uuid the gate itself refused — still bumped trust
+        # and reference_count and counted as a prefetch conversion. Its own
+        # docstring says only a deliberate act is worth moving trust for; a
+        # refused call is not one. 2026-09-26 round bundle01 F3. T738.
         # Seen UUIDs gate: reject if this UUID was never retrieved in this session
         if target_uuid not in self._uuid_to_tag:
             return tool_error(self._unseen_uuid_error(target_uuid, tag))
@@ -2486,6 +2503,7 @@ class LayeredMemoryProvider(MemoryProvider):
                 msg += f" Unsupported parameters filtered out: {', '.join(dropped)}."
             return tool_error(msg)
         self._backend.update(target_uuid, **clean)
+        self._mark_prefetch_used(target_uuid, reinforce=True)  # after success: T738
         # `.get()` under the lock, not a bare subscript. _prune_seen_uuids
         # rebinds _uuid_to_tag while holding _tag_lock, so a prune landing
         # between the membership gate above and this line raised KeyError out
@@ -2545,7 +2563,7 @@ class LayeredMemoryProvider(MemoryProvider):
                 )
         if target_uuid is None:
             return tool_error("layered_memory(action='delete') requires either 'uuid' or 'tag' parameter.")
-        self._mark_prefetch_used(target_uuid, reinforce=True)
+        # Rewarded after a delete that happened, not before the gate. T738.
         # Seen UUIDs gate
         if target_uuid not in self._uuid_to_tag:
             return tool_error(self._unseen_uuid_error(target_uuid, tag))
@@ -2558,6 +2576,8 @@ class LayeredMemoryProvider(MemoryProvider):
                 f"Call layered_memory(action='retrieve') to search for the correct memory."
             )
         _res = self._backend.delete(target_uuid)
+        if (_res or {}).get("status") == "deleted":
+            self._mark_prefetch_used(target_uuid, reinforce=True)
         # See _do_update: read under _tag_lock, and tolerate a pruned entry.
         with self._tag_lock:
             _tag = self._uuid_to_tag.get(target_uuid)
@@ -2671,7 +2691,7 @@ class LayeredMemoryProvider(MemoryProvider):
             return tool_error("Backend not initialized")
         result = self._backend.graph_health(
             threshold=args.get("threshold", 0.5),
-            limit=_coerce_int(args.get("limit"), 200),
+            limit=_coerce_int(args.get("limit"), _C.ADVANCED_LIMIT_DEFAULTS["graph_health"]),
             data_type=args.get("data_type"))
         if "error" in result:
             return tool_error(result["error"])
@@ -2719,7 +2739,7 @@ class LayeredMemoryProvider(MemoryProvider):
             return tool_error("query is required for discover")
         result = self._backend.discover(
             query=query,
-            limit=_coerce_int(args.get("limit"), 10),
+            limit=_coerce_int(args.get("limit"), _C.ADVANCED_LIMIT_DEFAULTS["discover"]),
             min_score=args.get("min_score", 0.0))
         # No content is returned, but `topic` and `data_id` are derived from it
         # by the classifier and carry the same injection risk.
@@ -2774,7 +2794,12 @@ class LayeredMemoryProvider(MemoryProvider):
         # _do_retrieve's max_layer/limit, missed by the search that found the
         # other five sites because it looked for int(args.get(...)) and this
         # one also has a float() twin.
-        raw_age = args.get("min_age_hours", 24.0)
+        # Explicit null means absent, as on MCP (which substitutes 24). It
+        # raised "min_age_hours must be a number, got None" here. Same rule
+        # as `register_taxonomy`'s `kind`. T732.
+        raw_age = args.get("min_age_hours")
+        if raw_age is None:
+            raw_age = 24.0
         try:
             min_age_hours = float(raw_age)
         except (TypeError, ValueError):
@@ -2833,13 +2858,12 @@ class LayeredMemoryProvider(MemoryProvider):
         # this shape after graph_health's `data_type` and memory_query's
         # `status`, both 0.7.94. T538's table gains a row rather than this
         # getting a one-off fix. 2026-08-25 bundle02 review (F3).
-        _budget = args.get("budget")
+        # One rule for both doors, at `check_budget`: `<= 0` alone let NaN
+        # and infinity through as "no bound". T736.
         try:
-            _budget = float(_budget) if _budget is not None else None
-        except (TypeError, ValueError):
-            return tool_error(f"budget must be a number of seconds, got {_budget!r}")
-        if _budget is not None and _budget <= 0:
-            return tool_error("budget must be positive")
+            _budget = _C.check_budget(args.get("budget"))
+        except ValueError as e:
+            return tool_error(str(e))
         # A negative bound is not a small bound, it is *no* bound: this reaches
         # `enrich_existing(... LIMIT ?)` and SQLite reads `LIMIT -1` as the whole
         # table, one LLM call per record. MCP refuses `<= 0` here (0.8.14, the
@@ -3035,7 +3059,7 @@ class LayeredMemoryProvider(MemoryProvider):
             # guard this door never had. 2026-08-26 ox-alpha, bundle04 F3.
             limit=max(1, min(_coerce_int(args.get("limit"), 20), 200)),
             offset=max(0, _coerce_int(args.get("offset"), 0)),
-            sort_by=args.get("sort_by"),
+            sort_by=args.get("sort_by") or args.get("sort"),  # alias: T743
         )
         for r in result.get("records", []) if isinstance(result, dict) else []:
             _wrap_summary_fields(r)
@@ -3064,8 +3088,14 @@ class LayeredMemoryProvider(MemoryProvider):
             return tool_error("layered_summaries search requires 'query' parameter")
         # Same clamp as the list arm above — a negative limit is "no limit"
         # to SQLite. bundle04 F3.
+        # `sort_by` forwarded, as MCP always has: the backend implements it
+        # and the schema advertises it, and this door dropped it, returning
+        # relevance order for `sort_by="updated_at"`. `sort` is the schema's
+        # declared alias and was read by no summaries handler at all.
+        # 2026-09-26 round bundle05 F4. T743.
         results = summaries.search(query,
                                    limit=max(1, min(_coerce_int(args.get("limit"), 10), 200)),
+                                   sort_by=args.get("sort_by") or args.get("sort"),
                                    profile_name=self._profile_name,
                                    profile=args.get("profile", "own"))
         for r in results:
@@ -3289,8 +3319,8 @@ class LayeredMemoryProvider(MemoryProvider):
                        # sleep, decay and purge all carry this predicate;
                        # review was the one sweep without it. `T709`.
                        "AND COALESCE(protected, 0) = 0 "
-                       "AND (julianday('now') - julianday(created_at)) * 24 >= ? "
-                       "ORDER BY created_at DESC LIMIT %d" % _C.REVIEW_BATCH_LIMIT)
+                       "AND (julianday('now') - julianday(created_at)) * 24 >= ?"
+                       + _C.REVIEW_BATCH_ORDER)
             else:
                 # IS NULL alone only ever admitted never-reviewed rows. A
                 # dry-run stamps llm_review_status on every record it
@@ -3314,8 +3344,8 @@ class LayeredMemoryProvider(MemoryProvider):
                        "AND (llm_review_status IS NULL OR llm_review_status = '' "
                        "OR llm_review_status = 'delete') "
                        "AND COALESCE(protected, 0) = 0 "
-                       "AND (julianday('now') - julianday(created_at)) * 24 >= ? "
-                       "ORDER BY created_at DESC LIMIT %d" % _C.REVIEW_BATCH_LIMIT)
+                       "AND (julianday('now') - julianday(created_at)) * 24 >= ?"
+                       + _C.REVIEW_BATCH_ORDER)
             records = self._backend._get_conn().execute(sql, (min_age,)).fetchall()
 
             if not records:
@@ -3347,7 +3377,11 @@ class LayeredMemoryProvider(MemoryProvider):
                     continue
                 _topic = _wrap_untrusted(r[2] or "", r[5])
                 _content = _wrap_untrusted((r[1] or "")[:200], r[5])
-                prompt += f"[{r[0]}] topic={_topic} type={r[3]} created={r[4]}\n"
+                # `type` outside the fence only if it has a label's shape —
+                # a name registered before T730's check existed can still be
+                # in a row, and this is the line it would forge.
+                _type = r[3] if _C.is_taxonomy_name(r[3]) else "unknown"
+                prompt += f"[{r[0]}] topic={_topic} type={_type} created={r[4]}\n"
                 prompt += f"  content: {_content}\n\n"
 
         except Exception as e:
@@ -3476,7 +3510,13 @@ class LayeredMemoryProvider(MemoryProvider):
             return tool_error(
                 f"similarity_threshold must be a number between 0.0 and 1.0, "
                 f"got {raw_threshold!r}")
-        if threshold < 0.0 or threshold > 1.0:
+        # Chained, not two comparisons: every comparison with NaN is False, so
+        # `threshold < 0.0 or threshold > 1.0` let `"nan"` through — and Qdrant
+        # reads a NaN `score_threshold` as *no* threshold. Driven 2026-09-27:
+        # `compact(similarity_threshold="nan", execute=true)` over four
+        # unrelated records merged three of them at similarity 0.42 and
+        # soft-deleted the originals. The backend refuses it too (T736).
+        if not 0.0 <= threshold <= 1.0:
             return tool_error("similarity_threshold must be between 0.0 and 1.0")
         topic = args.get("topic")
         raw_groups = args.get("max_groups", 50)
@@ -3511,7 +3551,7 @@ class LayeredMemoryProvider(MemoryProvider):
         if not self._backend:
             return tool_error("Backend not initialized")
         query = args.get("query")
-        limit = _coerce_int(args.get("limit"), 10)
+        limit = _coerce_int(args.get("limit"), _C.ADVANCED_LIMIT_DEFAULTS["traces"])
         traces = self._backend.get_traces(query=query, limit=limit)
         # Fence the stored `query`. It is free text a previous turn supplied —
         # possibly copied out of a web page or a vault note the agent was
@@ -3547,13 +3587,12 @@ class LayeredMemoryProvider(MemoryProvider):
         # this door never accepted it either, so `limit=0` ("every record")
         # had no time bound available at all on the plugin side.
         # 2026-08-26 xhigh round, bundle04 F2.
-        _budget = args.get("budget")
+        # One rule for both doors, at `check_budget`: `<= 0` alone let NaN
+        # and infinity through as "no bound". T736.
         try:
-            _budget = float(_budget) if _budget is not None else None
-        except (TypeError, ValueError):
-            return tool_error(f"budget must be a number of seconds, got {_budget!r}")
-        if _budget is not None and _budget <= 0:
-            return tool_error("budget must be positive")
+            _budget = _C.check_budget(args.get("budget"))
+        except ValueError as e:
+            return tool_error(str(e))
         result = self._backend.re_enrich(topic_only=topic_only, keyword_only=keyword_only,
                                           limit=limit, budget=_budget)
         return result
@@ -3581,7 +3620,7 @@ class LayeredMemoryProvider(MemoryProvider):
         stats["prefetch_value"] = self.prefetch_stats()
         return stats
 
-    def _do_export(self, args: dict) -> str:
+    def _do_export(self, args: dict) -> dict:
         """Export memories as JSON or Markdown."""
         if not self._backend:
             return tool_error("Backend not initialized")
@@ -3610,7 +3649,7 @@ class LayeredMemoryProvider(MemoryProvider):
         # 2026-08-23 review round 7 maintenance F12.
         cross_profile = _coerce_bool(args.get("cross_profile", False))
 
-        return self._backend.export_memories(
+        out = self._backend.export_memories(
             fmt=fmt,
             status=status,
             data_type=data_type,
@@ -3619,6 +3658,19 @@ class LayeredMemoryProvider(MemoryProvider):
             profile_name=profile_name,
             cross_profile=cross_profile,
         )
+        # The export is raw stored content, deliberately unfenced on both
+        # doors: it is a data-transfer payload that has to round-trip through
+        # `import`, and fence tags in it would be stored on the way back in.
+        # MCP has always said so in the response (`io_tools.py`); this door
+        # handed the model the bare blob — every record's content, vault notes
+        # and web scrapes included, straight into the context with neither a
+        # fence nor a word that it was untrusted. Same shape as MCP now, so
+        # the one mitigation a deliberately-unfenced read has reaches both
+        # doors. 2026-09-27 review round bundle03 F1 (filed Critical as "add
+        # the fence"; the fence is declined for the round-trip reason and
+        # recorded in docs/security.md, the missing warning is the defect).
+        # T726.
+        return {"format": fmt, "data": out, "warning": _C.EXPORT_WARNING}
 
     def _do_import(self, args: dict) -> dict:
         """Import memories from JSON data."""
@@ -3766,7 +3818,23 @@ class LayeredMemoryProvider(MemoryProvider):
         # Backup summaries DB
         summaries = self._ensure_summaries()
         if summaries:
-            summ_result = summaries.backup(dest_dir=mem_backup_dir)
+            # The memories DB's directory is an allowed root here: it is the
+            # root `dest_dir` was validated against above, and co-locating the
+            # two backups is the point (T677). And a summaries failure is
+            # reported beside a memories backup that succeeded, not raised
+            # past it — raising discarded the memories result and skipped the
+            # retention sweep, so every retried call left one more copy. The
+            # MCP twin already degraded this way. 2026-09-26 round bundle04 F6,
+            # driven 2026-09-27: memories DB and summaries DB in two directories
+            # outside the configured roots, `backup` with no arguments -> error,
+            # memories copy on disk, no summaries copy. T729.
+            try:
+                summ_result = summaries.backup(
+                    dest_dir=mem_backup_dir,
+                    extra_roots=[os.path.dirname(self._backend._db_path)])
+            except (ValueError, OSError, sqlite3.Error) as e:
+                logger.warning("backup: summaries backup failed: %s", e)
+                summ_result = {"error": f"summaries backup failed: {e}"}
             result["summaries"] = summ_result
 
         # Clean old backups. This must not require dest_dir — the common
@@ -3892,9 +3960,19 @@ class LayeredMemoryProvider(MemoryProvider):
         err = _require_str_arg(name, "name")
         if err:
             return tool_error(err)
+        # Explicit null means absent, as it does on MCP, whose typed
+        # `kind: str | None = None` cannot tell the two apart and so defaults
+        # both. `args.get("kind", "data_type")` passed an explicit None
+        # through, and the backend refused it: the plugin errored on the call
+        # MCP answered by registering a row. Empty string stays an error on
+        # both doors — present-but-invalid (`T653`). 2026-09-26 round bundle05
+        # F5. T732.
+        kind = args.get("kind")
+        if kind == "":
+            return tool_error("invalid kind: '' — omit it for the default, or name one")
         return self._backend.register_taxonomy(
             name=name,
-            kind=args.get("kind", "data_type"),
+            kind=kind if kind is not None else "data_type",
             collection=args.get("collection"),
             description=args.get("description"),
         )

@@ -154,7 +154,7 @@ HLM_QDRANT_URL=http://localhost:6333
 HLM_EMBED_URL=http://localhost:11434/api/embed
 HLM_EMBED_MODEL=qwen3-embedding:8b
 HLM_MAX_LAYER=2
-HLM_LAYER3_MODEL=QWEN3.6-27B
+HLM_LAYER3_MODEL=<your-model-id>
 HLM_LAYER3_BASE_URL=http://localhost:8000/v1
 HLM_LAYER3_API_KEY=your-api-key
 HLM_REASONING_EFFORT=none
@@ -214,7 +214,7 @@ hermes -p <profile> plugins disable hermes-layered-memory
 # Run full regression suite (~7-20 min — background it)
 python3 tests/run-regression.py
 
-# Run dispatch-layer tests (37 tests, ~15s)
+# Run dispatch-layer tests (37 tests, ~20-30s)
 python3 tests/test_dispatch.py
 ```
 

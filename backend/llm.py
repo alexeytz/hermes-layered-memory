@@ -198,6 +198,7 @@ def re_enrich(self, topic_only: bool = False, keyword_only: bool = False, limit:
     record, so the deadline is checked per record and the granularity is as
     fine as the work allows. 2026-08-26 ox-alpha xhigh round, bundle04 F2.
     """
+    budget = _C.check_budget(budget)  # T736
     # Find records with missing metadata
     where_clauses = ["status = 'active'"]
     params = []
@@ -538,6 +539,7 @@ def enrich_existing(self, since: str = None, max_items: int = _C.ENRICH_MAX_ITEM
     `_valid_timestamp` is a shared primitive in `core.py` for that reason.
     2026-09-25 structure review; `T704`.
     """
+    budget = _C.check_budget(budget)  # T736
     if since and not _valid_timestamp(since):
         raise ValueError(
             f"since must be a valid ISO timestamp, got {since!r} — an "

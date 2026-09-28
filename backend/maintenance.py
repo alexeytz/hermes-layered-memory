@@ -10,7 +10,6 @@ editor or type checker could follow.
 
 from __future__ import annotations
 import json
-import sqlite3
 
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
@@ -25,6 +24,7 @@ import uuid as uuid_mod
 
 from . import constants as _C
 from .core import (
+    connect_readonly,
     orphan_sweep_refused,
     MAX_CONTENT_CHARS,
     MAX_METADATA_CHARS,
@@ -1209,6 +1209,19 @@ def find_duplicate_groups(self, similarity_threshold, topic=None, max_groups=50)
     records are themselves touched and re-enter the window.
     2026-08-23 review round 7 maintenance F6.
     """
+    # The chokepoint for both doors. A NaN threshold disables the similarity
+    # gate entirely — Qdrant treats `score_threshold=nan` as none, and nothing
+    # below re-checks the score — so compaction merged unrelated records.
+    # `not 0 <= x <= 1` is the only spelling NaN cannot slip through.
+    # 2026-09-26 round bundle04 F3 (filed Major; the impact is worse than
+    # filed, which said NaN "cannot lower the bar"). T736.
+    try:
+        _thr = float(similarity_threshold)
+    except (TypeError, ValueError):
+        raise ValueError(f"similarity_threshold must be a number, got {similarity_threshold!r}")
+    if not 0.0 <= _thr <= 1.0:
+        raise ValueError(f"similarity_threshold must be between 0.0 and 1.0, got {similarity_threshold!r}")
+
     if not self._qdrant:
         return []
 
@@ -1882,6 +1895,16 @@ def export_memories(self, fmt: str = "json",
     where_parts = []
     params = []
 
+    # A closed vocabulary, refused rather than matched: any other string made
+    # `status = ?` match nothing and the export returned success with zero
+    # records — driven 2026-09-27, `'acitve'`, `'all '`, `'ACTIVE'` all gave
+    # `record_count: 0` on both doors. Visible, so Minor, but an export is
+    # the call a backup-minded caller least expects to be quietly empty.
+    # Same set `update()` enforces. 2026-09-26 round bundle02 F7. T733.
+    from .store import VALID_STATUSES
+    if status is not None and status != "all" and status not in VALID_STATUSES:
+        raise ValueError(
+            f"status must be one of {sorted(VALID_STATUSES)} or 'all', got {status!r}")
     if status and status != "all":
         where_parts.append("status = ?")
         params.append(status)
@@ -1918,9 +1941,7 @@ def export_memories(self, fmt: str = "json",
     )
 
     def _query_one(db_path, prof):
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn = connect_readonly(db_path)
         try:
             cursor = conn.execute(
                 f"SELECT {columns} FROM memories WHERE {base_where} "
@@ -2151,8 +2172,12 @@ def import_memories(self, data: str, mode: str = "skip_existing",
     """Import memories from JSON data.
 
     Args:
-        data: JSON string (from export) or Markdown text.
-              If a file path ending in .json is provided, reads from file.
+        data: JSON string (from ``export(format="json")``), or a path ending
+              in ``.json``/``.md`` to a file holding that JSON. A *Markdown
+              export* is a human-readable view and is not importable: this
+              docstring used to promise "Markdown text", and four documents
+              repeated it, while the only parser here is ``json.loads``.
+              2026-09-26 round bundle02 F6. T734.
         mode: 'skip_existing' (default) — skip records whose UUID already
               exists; 'overwrite' — update existing records;
               'new_uuid' — generate new UUIDs even for duplicates.
@@ -2225,6 +2250,14 @@ def import_memories(self, data: str, mode: str = "skip_existing",
         elif isinstance(export_data, list):
             records = export_data
     except (json.JSONDecodeError, TypeError):
+        # Name the one wrong input that is common enough to recognise: the
+        # other export format. "not valid JSON" is true and does not say what
+        # to do instead. T734.
+        if isinstance(data, str) and data.lstrip().startswith("# Layered Memory Export"):
+            return {"imported": 0, "skipped": 0, "failed": 1,
+                    "errors": ["This is a Markdown export, which is a human-readable "
+                               "view and cannot be imported. Export with "
+                               "format='json' and import that."]}
         return {"imported": 0, "skipped": 0, "failed": 1,
                 "errors": ["Input is not valid JSON"]}
 

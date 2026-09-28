@@ -350,7 +350,7 @@ calls, set `HLM_REASONING_EFFORT=provider_default` and check
 `tests/eval_retrieval.py` measures recall@5, MRR and latency per layer against a fixed corpus, so scoring changes can be judged instead of guessed:
 
 ```bash
-python3 tests/eval_retrieval.py                                   # 40 golden + 500 distractors
+python3 tests/eval_retrieval.py --spread                          # 258 golden + 500 filler, 113 queries
 python3 tests/eval_retrieval.py --max-layer 4 --profile <name>    # incl. L3/L4 (needs an LLM)
 python3 tests/eval_retrieval.py --scoring bm25_weight=0.2         # try a Layer-2 weight
 ```
@@ -359,16 +359,21 @@ python3 tests/eval_retrieval.py --scoring bm25_weight=0.2         # try a Layer-
 moving, so the harness carries a baseline:
 
 ```bash
-python3 tests/eval_retrieval.py --check           # exit 1 if recall/MRR dropped >5%
-python3 tests/eval_retrieval.py --write-baseline  # re-anchor after an intended change
+python3 tests/eval_retrieval.py --spread --check        # local fallback embedder
+python3 tests/eval_retrieval.py --spread --check \
+    --baseline tests/eval-baseline-prod.json             # production embedder exported
+python3 tests/eval_retrieval.py --spread --write-baseline [--baseline ...]  # re-anchor
 ```
 
 `--check` refuses to compare across a fingerprint change (corpus size, query
 count, `k`, or embedder) rather than silently comparing incomparable runs — so
 switching to `--profile <name>` will tell you to re-anchor instead of reporting a
-false regression. `tests/eval-baseline.json` is anchored on the local fallback
-embedder and needs no endpoint; `tests/eval-baseline-prod.json` records the
-production-embedder numbers for reference.
+false regression. `--spread` is part of the fingerprint, so a `--check` without
+it never matches. `tests/eval-baseline.json` is anchored on the local fallback
+embedder and needs no endpoint (re-anchored on the current corpus in 0.8.117 —
+it had carried the 700-record fingerprint since 0.8.80, so this bare command
+exited 2 on every host). `tests/eval-baseline-prod.json` is **the gate**: it is
+the baseline `T364` checks on every regression run.
 
 There is no CI in this repository to wire this into. Until there is, run
 `--check` before committing anything that touches `_layer0`-`_layer2`, the
@@ -377,8 +382,11 @@ scoring weights, or the embedding configuration. As a git hook:
 ```bash
 cat > .git/hooks/pre-push <<'EOF'
 #!/bin/sh
-# Retrieval regression gate. Needs Qdrant; ~90s.
-python3 tests/eval_retrieval.py --check || {
+# Retrieval regression gate. Needs Qdrant; ~7 min with the production
+# embedder (T364 took 416s on 2026-09-27). The baseline must match the
+# embedder the hook's environment resolves, or --check exits 2.
+if [ -n "$HLM_EMBED_MODEL" ]; then B=tests/eval-baseline-prod.json; else B=tests/eval-baseline.json; fi
+python3 tests/eval_retrieval.py --spread --check --baseline "$B" || {
   echo "retrieval regression — push aborted (use --no-verify to override)"; exit 1; }
 EOF
 chmod +x .git/hooks/pre-push
@@ -398,7 +406,7 @@ Check that `plugin.yaml` version matches `backend/constants.py`:
 python3 scripts/check-version.py
 ```
 
-If mismatched, update `backend/constants.py` to the desired version and regenerate `plugin.yaml`.
+If mismatched, bump **both** `plugin.yaml` and `backend/constants.py` by hand — nothing regenerates either — then re-run `check-version.py`.
 
 ## Testing
 
@@ -410,19 +418,20 @@ cd hermes-layered-memory
 docker compose up -d
 python3 tests/run-regression.py
 
-# Run dispatch-layer tests (37 tests, ~15s, catches schema/type bugs)
+# Run dispatch-layer tests (37 tests, ~20-30s, catches schema/type bugs)
 python3 tests/test_dispatch.py
 
-# Degraded-mode tests (Qdrant offline, dead embedder, recovery)
-python3 tests/test_chaos.py
+# Degraded-mode tests (Qdrant offline, dead embedder, recovery) are in
+# tests/test_chaos.py and run as part of the regression suite above; the file
+# has no __main__, so running it directly does nothing.
 
 # Measure retrieval quality — recall@5, MRR, latency per layer
 python3 tests/eval_retrieval.py --filler 500
 
 # Results written to tests/regression-results.json and tests/dispatch-results.json
-# Individual test files in tests/ can be run directly:
-python3 tests/test_core.py       # T1-T30: CRUD, filters, layers
-python3 tests/test_summaries.py  # T31-T46: Summaries
+# The test_*.py files have no __main__ and do nothing when run directly; the
+# runner discovers every test_t* function in them. Ids are not per-file ranges
+# (test_core.py spans T01-T202, test_summaries.py T31-T664) — check the file.
 ```
 
 ## MCP Server Issues

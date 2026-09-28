@@ -1932,6 +1932,13 @@ async def memory_maintenance(
 
 
 def _review_impl(be, min_age_hours: float, force: bool, execute: bool) -> dict:
+    """LLM keep/delete pass — the plugin's layered_maintenance review.
+
+    Synchronous by design, unlike the plugin's fire-and-forget thread: an MCP
+    call has no session to report back into later, so a caller that gets a
+    response needs the verdicts in it. Dry-run records verdicts without
+    deleting, matching the plugin.
+    """
     # Third member of the negative-age class. The WHERE below reads
     # `(julianday('now') - julianday(created_at)) * 24 >= ?`, so a negative
     # value matches records created seconds ago — and with `execute=true`
@@ -1942,13 +1949,6 @@ def _review_impl(be, min_age_hours: float, force: bool, execute: bool) -> dict:
     # 2026-08-25 xhigh round, bundle02 (F2).
     from backend.maintenance import _non_negative_age
     min_age_hours = _non_negative_age(min_age_hours, "min_age_hours")
-    """LLM keep/delete pass — the plugin's layered_maintenance review.
-
-    Synchronous by design, unlike the plugin's fire-and-forget thread: an MCP
-    call has no session to report back into later, so a caller that gets a
-    response needs the verdicts in it. Dry-run records verdicts without
-    deleting, matching the plugin.
-    """
     if not be.llm_configured():
         return {"error": "no LLM configured — set layer3_model and "
                          "layer3_provider_config.base_url", "executed": False}
@@ -1969,7 +1969,7 @@ def _review_impl(be, min_age_hours: float, force: bool, execute: bool) -> dict:
         # bulk retirement path and `protected` means do-not-touch. `T709`.
         "  AND COALESCE(protected, 0) = 0"
         "  AND (julianday('now') - julianday(created_at)) * 24 >= ?" + where +
-        " ORDER BY created_at LIMIT %d" % _C.REVIEW_BATCH_LIMIT, (min_age_hours,)).fetchall()
+        _C.REVIEW_BATCH_ORDER, (min_age_hours,)).fetchall()
     if not rows:
         return {"status": "complete", "executed": execute,
                 "reviewed": 0, "note": "nothing to review"}
@@ -2295,12 +2295,29 @@ async def memory_summaries(
                     res["records"] = _fence(res["records"], source=_UNTRUSTED_SUMMARY_SOURCE)
                 return json.dumps(res, default=str, indent=2)
             if action == "list_expiring":
-                if int(max_age_days or 0) < 0:
+                # Resolve once and forward the resolved value, like the plugin's
+                # `_do_list_expiring_summaries`. This checked
+                # `int(max_age_days or 0)` and forwarded the *raw* parameter,
+                # so the guard validated a copy and only the backend's own
+                # coercion (`max(0, int(...))`, 30 on failure) made the call
+                # come out right. A non-integer answered with the interpreter's
+                # `invalid literal for int()` text where the plugin says what
+                # the argument must be. The wire's argument model converts
+                # first, so no network client reached either; an in-process
+                # caller did. And `or 0` is the idiom the plugin abandoned one
+                # function over. 2026-09-27 review round, bundle05 F1 (Minor).
+                # T727.
+                try:
+                    _mad = 30 if max_age_days is None else int(max_age_days)
+                except (TypeError, ValueError):
+                    return json.dumps({"error": "max_age_days must be an integer "
+                                                "number of days"}, default=str)
+                if _mad < 0:
                     return json.dumps({"error": (
                         "max_age_days must be zero or positive, got %r — a negative "
                         "age puts the cutoff in the future and lists every summary"
-                        % (max_age_days,))}, default=str)
-                res = await asyncio.to_thread(sb.list_expiring, max_age_days=max_age_days,
+                        % (_mad,))}, default=str)
+                res = await asyncio.to_thread(sb.list_expiring, max_age_days=_mad,
                                               profile_name=prof, profile=scope)
                 return json.dumps(_fence(res, source=_UNTRUSTED_SUMMARY_SOURCE),
                                   default=str, indent=2)
@@ -2375,7 +2392,7 @@ async def memory_advanced(
     helpful: bool | None = None,
     query: str | None = None,
     layer: int = 2,
-    limit: int = 10,
+    limit: int | None = None,
     max_items: int = _C.ENRICH_MAX_ITEMS_DEFAULT,
     since: str | None = None,
     topic: str | None = None,
@@ -2390,6 +2407,12 @@ async def memory_advanced(
     budget: float | None = None,
 ) -> str:
     """Advanced operations mirroring the plugin's layered_advanced (+ peek)."""
+    # One `limit` parameter serves every action here, so its default has to be
+    # resolved per action — a single `= 10` made graph_health scan 10 records
+    # where the plugin scans 200. `reenrich` keeps 10: this door refuses
+    # `<= 0` because the limit is what meters LLM spend. T741.
+    if limit is None:
+        limit = _C.ADVANCED_LIMIT_DEFAULTS.get(action, 10)
     async with _SEMAPHORE:
         try:
             _guard("memory_advanced", action, profile)
@@ -2595,10 +2618,17 @@ async def memory_advanced(
                 # it. The plugin has degraded gracefully here since it was
                 # written; this door did not. One member of a class again.
                 # 2026-09-15 review round 2, bundle04 (F10). T649.
+                #
+                # WARNING, not DEBUG — the plugin twin's level and the house
+                # rule for a production-visible failure. It was DEBUG, which
+                # cost nothing only because `extraction_stats` swallowed every
+                # read error itself and this branch never ran; now that an
+                # unreadable ledger raises (T724), this line is the operator's
+                # only sign of it. 2026-09-27 review round, bundle04.
                 try:
                     _extraction = await asyncio.to_thread(be.extraction_stats)
                 except Exception as e:
-                    logger.debug("MCP stats: extraction stats unavailable: %s", e)
+                    logger.warning("MCP stats: extraction stats unavailable: %s", e)
                     _extraction = None
                 return json.dumps({
                     "retrieval": await asyncio.to_thread(be.retrieval_stats),
@@ -2722,6 +2752,7 @@ async def memory_advanced(
 _CTX = SimpleNamespace(
     guard=_guard,
     safe_error=_safe_error,
+    refusal_or_safe_error=_refusal_or_safe_error,
     as_text=_as_text,
     registry=_registry,
     semaphore=_SEMAPHORE,

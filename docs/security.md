@@ -77,7 +77,7 @@ of a model wraps non-self-authored content in `<untrusted_external_doc>` tags:
 | Conflict-resolution preview | `_do_resolve_conflicts` (`__init__.py`), `resolve_conflicts` action (`mcp_server.py`) | content, scope, source — the list is `PREVIEW_FENCED_FIELDS` in `backend/constants.py`, read by both doors; `source` carries at group *and* entry level |
 | Compaction preview | `_do_compact` (`__init__.py`), `compact` action/op (`mcp_server.py`) | content, scope, source — same `PREVIEW_FENCED_FIELDS` tuple; `scope` and `source` ride **untruncated** where content is capped at 80 chars |
 | `delete_many` sample | `delete_many` (`backend/store.py`) — **the backend**, not the doors: the plugin returns the dict verbatim and MCP `json.dumps`-es it, and neither receives the row's `source` to judge by | content, truncated to 60 chars by the SELECT and fenced after, since `_wrap_untrusted_text` strips a *complete* delimiter and a tag cut in half by `substr` is not one. Unfenced on all three return paths (`refused`/`dry_run`/`complete`) until 0.8.113 — the same hole `memory_write action="list"` had (`T405`), on a mutating action (`T712`, `T713`) |
-| Summary read/search/browse | `_do_get_summary`, `_do_search_summaries`, `_do_list_summaries` (`__init__.py`) | title, highlights, snippet, tags, metadata |
+| Summary read/search/browse | `_do_get_summary`, `_do_search_summaries`, `_do_list_summaries` (`__init__.py`) | title, highlights, snippet, tags, metadata, source_url, full_text — `source_url` was returned raw on all three until 0.8.116 while MCP fenced it (`T744`) |
 | L3 reranker prompt | `_layer3` (`backend/pipeline.py`) | topic, summary — keyed through `_prompt_trust_source`, so a cross-profile record is fenced even when its own `source` is self-authored (0.7.89) |
 | L4 gap-detection prompt | `_layer4` (`backend/pipeline.py`) | topic, summary — keyed through `_prompt_trust_source`, so a cross-profile record is fenced even when its own `source` is self-authored (0.7.89) |
 | LLM classification | `_llm_classify`, `_llm_classify_batch` (`backend/llm.py`) | content, summary |
@@ -96,6 +96,17 @@ copy of the ten-field loop, and four fields were found unfenced one review round
 at a time because a field added to one copy was not added to the others
 (`T618`). **Adding a field to a read response means adding it to
 `_FENCED_FIELDS` and to this table — one edit each, not four.**
+
+**`export` is the one read path that is unfenced on purpose, on both doors.**
+It is a data-transfer payload that must round-trip through `import`, and fence
+tags in it would be stored on the way back in. Its mitigation is a `warning`
+key in the response — `{"format", "data", "warning"}`, the text shared as
+`EXPORT_WARNING` in `backend/constants.py`. Until 0.8.116 only MCP carried it;
+the plugin's `layered_io(action="export")` handed the model the bare blob, every
+record's content included, with neither a fence nor a word. A declined fence
+with no row here is indistinguishable, to the next review round, from one
+nobody thought of — the 2026-09-27 round filed it as a Critical for exactly that
+reason (`T726`).
 
 **Model output is fenced too, not just stored content.** The rows above are
 about records going *into* a prompt. These are about what comes *out* of an
@@ -122,7 +133,7 @@ additionally carry an explicit instruction to ignore operational commands found
 inside the tags. The review prompt goes further and states that a verdict may
 never come from inside a record — its output drives `backend.delete()`, so an
 injected `DELETE <uuid>` line would otherwise be actionable against the other
-records in the same 100-record review batch.
+records in the same review batch (`REVIEW_BATCH_LIMIT`, 200).
 
 The delimiter is stripped from the payload before wrapping, so a document
 containing a literal `</untrusted_external_doc>` cannot close its own fence and
@@ -233,6 +244,14 @@ that directory. `keep_days` is validated as a non-negative integer for the same
 reason: a fractional value would set the cutoff seconds in the past and delete
 the backup just written.
 
+**Which roots each check uses.** Both use `HLM_BACKUP_ALLOWED_ROOTS` (default:
+the real home) plus the directory of the database being backed up. The
+summaries copy is written beside the memories copy on purpose (`T677`), so the
+summaries store is also given the **memories** database's directory as a root:
+until 0.8.116 it checked only its own, and with the two databases in different
+directories outside the configured roots a `backup` with no arguments wrote the
+memories copy and then failed the call on the plugin door (`T729`).
+
 The MCP side (`mcp_tools/io_tools.py`'s `memory_io action="backup"`) declared
 and documented the same `keep_days` parameter — "pruning past keep_days" —
 without reading it: until v0.7.55 the sweep simply did not run there, and an
@@ -323,9 +342,14 @@ filesystem paths out of *exceptions*; it does nothing about a response that
 returns one on purpose. Two have been found and removed that way —
 `get_status`'s `db_path` (2026-08-22) and `list_profiles`' (0.8.71, round 2
 bundle04 F3) — and both had survived review before because the leak was in the
-half nobody thinks of as an error path. Both now return the basename;
-`list_profiles` resolves symlinks *before* taking it, so an alias and its
-target still report the same file without naming a directory.
+half nobody thinks of as an error path. Both now return the basename **on the
+MCP door**, the unauthenticated one; `list_profiles` resolves symlinks *before*
+taking it, so an alias and its target still report the same file without naming
+a directory. The plugin's `layered_memory(action="list_profiles")` still returns
+the full `db_path`, deliberately: its caller is the operator's own agent on the
+same host, not an arbitrary network client. The 2026-09-27 review round read
+this paragraph against the backend's `list_profiles` and could not tell which
+half was stale, because it did not say which door it meant.
 
 **`sensitivity` is not encryption or access control.** It suppresses
 auto-injection. The content sits in plaintext SQLite, is embedded into Qdrant,

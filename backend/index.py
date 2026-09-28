@@ -10,7 +10,6 @@ editor or type checker could follow.
 
 from __future__ import annotations
 import json
-import sqlite3
 import os
 
 from typing import Any, List, Optional
@@ -22,6 +21,7 @@ import re
 
 from . import constants as _C
 from .core import (
+    connect_readonly,
     orphan_sweep_refused,
     claimed_overlap as _claimed_overlap,
     profile_release as _profile_release,
@@ -1114,9 +1114,7 @@ def _fallback_uuids(self, data_type: str = None,
         if not db_path or not os.path.exists(db_path):
             continue
         try:
-            conn = sqlite3.connect(db_path, check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn = connect_readonly(db_path)
             where = "SELECT uuid FROM memories WHERE status='active'"
             # Check for superseded_by column (pre-v14 schemas don't have it)
             cols = [r[1] for r in conn.execute("PRAGMA table_info(memories)").fetchall()]
@@ -1461,9 +1459,7 @@ def _fts5_fallback(self, query: str, scope: str = None,
             continue
         conn = None
         try:
-            conn = sqlite3.connect(db_path, check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn = connect_readonly(db_path)
             db_where = where
             if supersede_clause:
                 prof_cols = [r[1] for r in conn.execute("PRAGMA table_info(memories)")]

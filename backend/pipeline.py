@@ -10,7 +10,6 @@ editor or type checker could follow.
 
 from __future__ import annotations
 import json
-import sqlite3
 import os
 import pwd
 
@@ -27,6 +26,7 @@ import re
 
 from . import constants as _C
 from .core import (
+    connect_readonly,
     _conflict_partners,
     _setting,
     _unpack_embedding,
@@ -213,7 +213,18 @@ def get_traces(self, query: str = None, limit: int = 10) -> List[dict]:
     The deque keeps the last `limit` *matching* entries per file in one forward
     pass, so a `query` filter still returns the most recent matches rather than
     the oldest, and the file is never held in memory whole.
+
+    `limit` is clamped here, at the one place both doors reach — like
+    `discover` and `graph_health` already do for theirs. `0` and negatives
+    hit `len(results) >= limit` on the first file and answered "no traces"
+    with no error, on both doors, while trace files held entries.
+    2026-09-26 round bundle04 F5 (filed as MCP-only; it was the backend).
+    T741.
     """
+    try:
+        limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        limit = 10
     results = []
     try:
         trace_dir = os.path.join(os.path.dirname(self._db_path), ".hlm-traces")
@@ -806,9 +817,7 @@ def _layer1(self, candidates: List[tuple], query: str,
             continue
         conn = None
         try:
-            conn = sqlite3.connect(db_path, check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn = connect_readonly(db_path)
             # Apply the supersession filter only where the column exists.
             # Schema v14 is added when this code opens a database; a
             # cross-profile read touches other profiles' files directly and
@@ -1773,7 +1782,7 @@ def list_profiles(self) -> List[dict]:
         info = {"profile": name, "db_path": db_path, "is_current": is_current}
         if os.path.exists(db_path):
             try:
-                conn = sqlite3.connect(db_path, check_same_thread=False)
+                conn = connect_readonly(db_path)
                 try:
                     # Active record count (exclude superseded records, matching count())
                     cols = [r[1] for r in conn.execute("PRAGMA table_info(memories)").fetchall()]
@@ -1812,12 +1821,17 @@ def list_profiles(self) -> List[dict]:
                         # antipattern the repo's own style notes warn about,
                         # in the codebase. 2026-08-24 audit, minor 30.
                         sum_path = _setting("HLM_SUMMARIES_DB")
+                        # Through the shared resolver: this copy handled `~`
+                        # and not `$VAR`, so a `$VAR` path named a file that
+                        # does not exist and every profile listed 0 summaries
+                        # while the two doors read and wrote the real one.
+                        # 2026-09-27 review round bundle04 F2. T725.
                         if not sum_path:
                             sum_path = os.path.join(_real_home, ".hermes", "hermes-layered-memory-dbs", "digests.db")
-                        elif sum_path.startswith("~"):
-                            sum_path = sum_path.replace("~", _real_home, 1)
+                        else:
+                            sum_path = _C.resolve_user_path(sum_path)
                         if os.path.exists(sum_path):
-                            sum_conn = sqlite3.connect(sum_path, check_same_thread=False)
+                            sum_conn = connect_readonly(sum_path)
                             try:
                                 # Scope the count to this profile. The
                                 # summaries DB is shared but carries a

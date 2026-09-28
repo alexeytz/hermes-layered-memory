@@ -14,14 +14,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import sqlite3
 import logging
-import pwd
 import threading
 logger = logging.getLogger(__name__)
 
 # `backend.constants` is a stdlib-only leaf module, so importing it here adds
 # no cycle: it is the only place both this file and `backend/` can share a
 # definition, and the string-filter refusal is one defect found in six places.
-from backend.constants import require_str_filters  # noqa: E402
+from backend.constants import real_home, require_str_filters, resolve_user_path  # noqa: E402
 
 #: The two words a caller may use for `profile`/`scope` on a summaries call.
 #: One definition, because the vocabulary was enforced on exactly one of nine
@@ -66,19 +65,15 @@ class SummariesBackend:
             summaries_dir: Directory for .md summary files.
                           Default: ~/Documents/hlm-summaries/
         """
-        # Resolve ~ to real home (Hermes remaps $HOME)
-        real_home = pwd.getpwuid(os.getuid()).pw_dir
-        if db_path.startswith("~"):
-            db_path = db_path.replace("~", real_home, 1)
-        elif "$" in db_path:
-            db_path = os.path.expandvars(db_path)
-        self._db_path = db_path
-        # Resolve summaries_dir — use real home, not profile HOME
+        # Both paths through one resolver (`~` -> real home, else `$VAR`).
+        # The directory used to take only the default branch, so a configured
+        # `$X/md` was used verbatim and the plugin wrote .md files into a
+        # directory literally named `$X`. T725.
+        self._db_path = resolve_user_path(db_path)
         if summaries_dir:
-            self._summaries_dir = summaries_dir
+            self._summaries_dir = resolve_user_path(summaries_dir)
         else:
-            real_home = pwd.getpwuid(os.getuid()).pw_dir
-            self._summaries_dir = os.path.join(real_home, "Documents", "hlm-summaries/")
+            self._summaries_dir = os.path.join(real_home(), "Documents", "hlm-summaries/")
 
         # Ensure directories exist
         os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
@@ -901,9 +896,15 @@ class SummariesBackend:
         query += scope_sql
         params.extend(scope_params)
 
-        # Sort: default created_at DESC, allow updated_at DESC
+        # Sort: default created_at DESC, allow updated_at DESC.
+        # COALESCE: `updated_at` is NULL until a summary is first edited, so
+        # "ORDER BY updated_at" tied every never-edited row and returned them
+        # in arbitrary order — the sort the caller asked for, applied to
+        # nothing. Until an edit, a row's last change is its creation.
+        # Found writing T743, which drove the plugin's newly-forwarded
+        # `sort_by` and got oldest-first back. T743.
         if sort_by == "updated_at":
-            query += " ORDER BY updated_at DESC"
+            query += " ORDER BY COALESCE(updated_at, created_at) DESC"
         else:
             query += " ORDER BY created_at DESC"
         query += " LIMIT ? OFFSET ?"
@@ -1000,7 +1001,7 @@ class SummariesBackend:
         # list_summaries() just above: created_at/updated_at DESC, default
         # rank (relevance).
         if sort_by == "updated_at":
-            order_clause = "ORDER BY s.updated_at DESC"
+            order_clause = "ORDER BY COALESCE(s.updated_at, s.created_at) DESC"  # T743
         elif sort_by == "created_at":
             order_clause = "ORDER BY s.created_at DESC"
         else:
@@ -1572,13 +1573,21 @@ class SummariesBackend:
             finally:
                 self._conn_local.conn = None
 
-    def backup(self, dest_dir: Optional[str] = None) -> dict:
+    def backup(self, dest_dir: Optional[str] = None,
+               extra_roots: Optional[List[str]] = None) -> dict:
         """Backup summaries database to a copy file.
 
         Uses SQLite's atomic backup API (WAL-safe).
 
         Args:
             dest_dir: Directory for the backup file. Default: beside the original DB.
+            extra_roots: Additional allowed roots for ``dest_dir``. Both
+                ``backup`` doors pass the memories database's own directory:
+                they co-locate this backup with the memories backup (T677), and
+                that directory is the root they already validated ``dest_dir``
+                against. Without it, a memories DB outside the configured roots
+                produced a memories backup this store then refused to join —
+                on the plugin door with no arguments at all. T729.
 
         Returns:
             dict with backup_path, timestamp, size_bytes.
@@ -1599,6 +1608,7 @@ class SummariesBackend:
             from backend.maintenance import _allowed_fs_roots, _path_within_roots
             roots = _allowed_fs_roots("HLM_BACKUP_ALLOWED_ROOTS")
             roots.append(os.path.realpath(os.path.dirname(self._db_path)))
+            roots.extend(os.path.realpath(r) for r in (extra_roots or ()))
             if not _path_within_roots(dest_dir, roots):
                 raise ValueError(
                     f"Backup destination {dest_dir!r} is outside allowed roots "
