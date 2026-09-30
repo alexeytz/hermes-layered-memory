@@ -171,14 +171,21 @@ HLM_LOG=DEBUG
 ### 5. Verify
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python scripts/check-environment.py
+scripts/make-dev-venv.sh              # once: ~/.venvs/hlm-dev, ~30s
+~/.venvs/hlm-dev/bin/python scripts/check-environment.py
 ```
 
-Run it — and the suites below — with the **Hermes venv's** interpreter: that
-is where the dependencies went and what the plugin runs in. A system `python3`
-without them makes the suites' preflight refuse, and made this check say READY
-for an environment the plugin could not use (fixed in 0.8.119; it now checks
-the packages and names the interpreter).
+Run it — and the suites below — with the dev venv that script builds: Hermes
+installed from its checkout plus the suites' dependencies, on the Python Hermes
+runs on, with CPU-only torch. It is separate from Hermes' own environment on
+purpose: that one holds only what Hermes and its plugins declare. The check
+answers two different interpreter questions and keeps them apart: the packages
+in the interpreter running it (what the suites need), and the plugin's
+declared dependencies in **the environment Hermes actually runs** — which, on a
+Hermes with its package manager, is not `~/.hermes/hermes-agent/venv` at all
+(see [Dependencies](#dependencies)). `--hermes-python` prints that runtime's
+interpreter. The check finds it read-only and never starts Hermes, because a
+Hermes launch can install dependencies.
 
 Two verdicts, deliberately separate: the repo's own invariants (the same answer
 on every machine) and this machine's readiness (embedder reachable, Qdrant
@@ -217,52 +224,117 @@ hermes -p <profile> plugins disable hermes-layered-memory
 ## Testing
 
 ```bash
+# The suites' interpreter (once; idempotent)
+scripts/make-dev-venv.sh
+
 # Run full regression suite (~7-20 min — background it)
-~/.hermes/hermes-agent/venv/bin/python tests/run-regression.py
+~/.venvs/hlm-dev/bin/python tests/run-regression.py
 
 # Run dispatch-layer tests (37 tests, ~20-30s)
-~/.hermes/hermes-agent/venv/bin/python tests/test_dispatch.py
+~/.venvs/hlm-dev/bin/python tests/test_dispatch.py
 ```
 
 ```bash
 # Is this clone and this machine actually ready?
-~/.hermes/hermes-agent/venv/bin/python scripts/check-environment.py
+~/.venvs/hlm-dev/bin/python scripts/check-environment.py
 ```
 
 The suite is not part of this distribution; see the development repository.
 
 ## Dependencies
 
-HLM's Python dependencies are **not auto-installed** by Hermes. After a Hermes upgrade:
+**Hermes installs the required ones.** Since Hermes' package manager
+(`~/.hermes/hermes-agent/pm/`, upstream 2026-08-29) Hermes runs in an environment it builds itself under
+`~/.hermes/installs/`, rebuilt on every dependency sync — a launch from
+`~/.hermes/hermes-agent/venv` is re-executed there. A plugin's Python packages
+reach that environment from one place: its `plugin.yaml` `pip_dependencies`.
+HLM declares `qdrant-client` and `numpy`; with `memory.provider:
+hermes-layered-memory` set (step 3), the next Hermes launch installs them.
+Confirm with the check in [step 5](#5-verify): its "plugin dependencies in the
+Hermes runtime" line probes that environment, wherever it is.
+
+> **If a sync cannot resolve a plugin's dependencies, Hermes disables the
+> plugin** — in every profile that uses it: `memory.provider` is set to `''`
+> and the plugin is added to `plugins.disabled`. That is Hermes' own policy (an
+> update must not fail because of a plugin). Nothing in HLM's declaration can
+> trigger it on a supported platform, but a hand-edited `plugin.yaml` can: after
+> changing it, run Hermes once and check each profile's `memory.provider`.
+
+**Hermes without the package manager** (no `~/.hermes/hermes-agent/pm/`):
+install into the in-tree venv yourself —
 
 ```bash
-# torch first, from the CPU index. `sentence-transformers` depends on torch, and
-# the default PyPI torch wheel is the CUDA build — it pulls the nvidia-* runtime
-# libraries and triton with it. Measured on a CPU-only host: 2.7G of nvidia-*,
-# 1.1G of torch and 690M of triton, to run a library that is itself 4.8M.
-#
-# None of it is ever used. HLM constructs the model as
-# `SentenceTransformer(model, device="cpu")` (backend/core.py) — hardcoded — so
-# it would not touch a GPU even on a machine that has one. On a GPU-less host
-# `torch.cuda.is_available()` is False and the CUDA libraries are never loaded.
-# The CPU wheel is the right choice on every host, which is why this is not a
-# trade-off worth thinking about.
-~/.hermes/hermes-agent/venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-~/.hermes/hermes-agent/venv/bin/pip install qdrant-client numpy sentence-transformers
+~/.hermes/hermes-agent/venv/bin/pip install qdrant-client numpy
 ```
 
-If you already installed the CUDA build, `pip uninstall torch` and re-run the
-first command; the `nvidia-*` and `triton` packages can be uninstalled too.
+**The local fallback embedder (optional).** Used unless both `HLM_EMBED_URL`
+and `HLM_EMBED_MODEL` are set (a URL alone does not select the remote tier) or
+`HLM_LOCAL_EMBED_MODEL` is: `sentence-transformers`
+with a 384-dim MiniLM model. It is deliberately **not** declared, because it
+needs torch, and the torch Hermes would resolve from PyPI is the CUDA build —
+measured on a CPU-only host: 2.7G of `nvidia-*`, 1.1G of torch and 690M of
+triton for a library that is itself 4.8M and that HLM runs with
+`device="cpu"` hardcoded (`backend/core.py`). The CPU wheel is right on every
+host.
 
-Skip torch entirely if you are not using the default local embedder: set
-`HLM_EMBED_URL` (any Ollama-compatible endpoint) or `HLM_LOCAL_EMBED_MODEL`
-(FastEmbed, ONNX, no torch), and `sentence-transformers` is never imported.
+- *Hermes without the package manager:*
+
+  ```bash
+  ~/.hermes/hermes-agent/venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+  ~/.hermes/hermes-agent/venv/bin/pip install sentence-transformers
+  ```
+
+- *Hermes with the package manager:* tested on 2026-09-29 (Hermes
+  v0.21.5+4477, Python 3.14, torch 2.14.0+cpu, sentence-transformers 6.1.0,
+  384-dim vectors, ~780M of torch, no `nvidia-*`). Add
+  `"sentence-transformers>=5.5"` to `pip_dependencies` in your `plugin.yaml`,
+  then run one sync with PyTorch's CPU index made visible to uv:
+
+  ```bash
+  cd ~/.hermes/hermes-agent
+  env UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
+      UV_INDEX_STRATEGY=unsafe-best-match \
+      ~/.hermes/tools/python-3.14*/bin/python3 -m hermes_cli.venv_sync
+  ```
+
+  Both variables are needed: without the strategy uv takes every package the
+  PyTorch index also carries from that index only, and the sync fails
+  resolving pinned `certifi`/`setuptools`. With it, five further packages
+  (`numpy`, `pillow`, `jinja2`, `markupsafe`, `colorama`) resolve from the
+  PyTorch index too, at the same versions as PyPI. The lock records torch's
+  CPU source, so ordinary launches keep it; a later `hermes update` that
+  relocks Hermes' own dependencies may not — re-run the sync above after one.
+  **Do not use `UV_FIND_LINKS` with PyTorch's torch page instead:** tried, it
+  resolved the CUDA build from PyPI and the failed resolution disabled the
+  plugin in every profile (above). Keeping a local edit to `plugin.yaml` also
+  means resolving it on every `git pull`.
+
+**Or skip torch — both routes below were tested on 2026-09-29:**
+
+- *Local, no torch:* `fastembed` (ONNX). Installed into a Python 3.14 venv it
+  is ~220M with no torch, and HLM's embedder produced vectors through it
+  (`HLM_LOCAL_EMBED_MODEL=BAAI/bge-small-en-v1.5`, 384-dim;
+  `intfloat/multilingual-e5-large` gives 1024-dim, 100+ languages). It also
+  resolves against a package-manager Hermes's pinned dependencies (`uv lock`
+  on a copy of its workspace, `numpy` unchanged), so under the package manager
+  add `"fastembed"` to `plugin.yaml`'s `pip_dependencies` and start Hermes —
+  the same local-edit caveat as above, without the index gymnastics. Without
+  the package manager: `~/.hermes/hermes-agent/venv/bin/pip install fastembed`.
+- *Remote:* `HLM_EMBED_URL` + `HLM_EMBED_MODEL`, Ollama's `/api/embed` or any
+  OpenAI-compatible `/v1/embeddings`; `HLM_EMBED_API_KEY` for hosted ones. For
+  example OpenRouter's `qwen/qwen3-embedding-8b` — the same model as Ollama's
+  `qwen3-embedding:8b`, measured at cosine 0.989-0.994 to it for the same text
+  — at the cost of sending every memory and query to that service.
+
+Either way `sentence-transformers` is never imported. **The test suite is the exception** — it exercises the MiniLM
+fallback, so the interpreter running the suites needs `sentence-transformers`
+and Hermes' own packages: `scripts/make-dev-venv.sh` builds exactly that.
 
 | Package | Required? | Purpose |
 |---------|-----------|---------|
-| qdrant-client >= 1.18 | Yes | Qdrant vector search client |
-| numpy | Yes | Brute-force semantic search fallback |
-| sentence-transformers >= 5.5 | Only for the default local embedder | 384-dim MiniLM fallback; install torch from the CPU index first (above). Unused when `HLM_EMBED_URL` or `HLM_LOCAL_EMBED_MODEL` is set |
+| qdrant-client >= 1.18 | Yes — declared in `plugin.yaml` | Qdrant vector search client |
+| numpy | Yes — declared in `plugin.yaml` | Brute-force semantic search fallback |
+| sentence-transformers >= 5.5 | Only for the default local embedder | 384-dim MiniLM fallback; install torch from the CPU index first (above). Unused when `HLM_EMBED_URL` + `HLM_EMBED_MODEL` (both) or `HLM_LOCAL_EMBED_MODEL` is set |
 | fastembed | No | Local multilingual embedding |
 | Docker + Docker Compose | No | Qdrant container |
 
@@ -295,7 +367,7 @@ See [docs/mcp.md](docs/mcp.md) for standalone usage and the full multi-agent des
 
 **Branch policy:** `main` is production-ready. Feature branches prefixed `feature/` or `fix/`.
 
-**Mandatory:** code changes require corresponding test updates. Run `python3 tests/run-regression.py && python3 tests/test_dispatch.py` before committing.
+**Mandatory:** code changes require corresponding test updates. Run `~/.venvs/hlm-dev/bin/python tests/run-regression.py && ~/.venvs/hlm-dev/bin/python tests/test_dispatch.py` before committing (the dev venv from `scripts/make-dev-venv.sh`).
 
 `docs/architecture.md` covers the pipeline and data model, and `docs/reference.md` the full tool and config surface.
 

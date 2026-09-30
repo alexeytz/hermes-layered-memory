@@ -35,6 +35,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 from conftest import (  # noqa: E402
     plugin_module,
     QDRANT_URL,
@@ -15562,3 +15564,303 @@ def test_t754():
         if prov and prov._backend:
             _cleanup_qdrant_coll(prov._backend); prov._backend.close()
         _cleanup_db("t754env"); _cleanup_db("t754cfg")
+
+
+def test_t758():
+    """`prefetch_limit` sets how many records prefetch injects, and 0 turns it off.
+
+    The count was a literal `results[:5]` in `prefetch()`, so an operator who
+    judged the injection unhelpful could neither shrink it nor switch it off
+    short of editing the plugin. Measured 2026-09-28 on hlm-test before the
+    change: 13,908 records injected over 3,001 sessions, and a probe session
+    that re-fetched its already-injected answer four times.
+
+    Asserted here: the configured count bounds the block; `0` returns before
+    the retrieve (an operator who disabled prefetch must not still pay an
+    embedder call per turn — an empty block alone would pass a weaker test);
+    the door refuses out-of-range values; a hand-edited out-of-range value is
+    clamped rather than trusted; `HLM_PREFETCH_LIMIT` reaches the config.
+    """
+    plugin = _plugin_module()
+    be = _make_backend("t758")
+    try:
+        for i, host in enumerate(("alpha", "bravo", "charlie", "delta")):
+            be.add(content=f"t758 kubernetes cluster {host} runs version 1.{29 + i}",
+                   data_type="ENV-DATA", data_id="k8s", source="agent", force=True)
+        prov = plugin.LayeredMemoryProvider()
+        prov._backend = be
+        prov._session_id = "t758"
+        prov._max_layer = 2
+        q = "which kubernetes version does each cluster run"
+        lines = lambda out: [l for l in out.splitlines() if l.startswith("- [")]
+
+        assert prov._prefetch_limit() == 5, "default must stay 5"
+        assert len(lines(prov.prefetch(q))) == 4, "all four records fit under the default"
+
+        out = prov.handle_tool_call("layered_config",
+                                    {"action": "set", "key": "prefetch_limit", "value": "2"})
+        assert "error" not in out, out
+        assert len(lines(prov.prefetch(q))) == 2, "prefetch_limit=2 must inject at most 2"
+
+        prov.handle_tool_call("layered_config",
+                              {"action": "set", "key": "prefetch_limit", "value": "0"})
+        calls = []
+        real = be.retrieve
+        be.retrieve = lambda *a, **k: calls.append(1) or real(*a, **k)
+        try:
+            assert prov.prefetch(q) == "", "prefetch_limit=0 must inject nothing"
+            assert not calls, "prefetch_limit=0 still ran a retrieve — off must mean off"
+        finally:
+            be.retrieve = real
+
+        for bad in ("-1", str(plugin.PREFETCH_LIMIT_MAX + 1)):
+            out = prov.handle_tool_call("layered_config",
+                                        {"action": "set", "key": "prefetch_limit", "value": bad})
+            assert "error" in out and "prefetch_limit" in out, f"{bad!r} accepted: {out}"
+
+        be._config["prefetch_limit"] = 999
+        assert prov._prefetch_limit() == plugin.PREFETCH_LIMIT_MAX
+        be._config["prefetch_limit"] = -3
+        assert prov._prefetch_limit() == 0
+    finally:
+        _cleanup_qdrant_coll(be); be.close(); _cleanup_db("t758")
+
+    old = os.environ.get("HLM_PREFETCH_LIMIT")
+    os.environ["HLM_PREFETCH_LIMIT"] = "0"
+    try:
+        be2 = _make_backend("t758e")
+        try:
+            assert be2._config.get("prefetch_limit") == 0, (
+                "HLM_PREFETCH_LIMIT=0 did not reach the config")
+        finally:
+            be2.close(); _cleanup_db("t758e")
+    finally:
+        if old is None:
+            os.environ.pop("HLM_PREFETCH_LIMIT", None)
+        else:
+            os.environ["HLM_PREFETCH_LIMIT"] = old
+
+
+def test_t764():
+    """The FastEmbed branch does not state a dimension it does not know.
+
+    `_get_embedding_fn` logged `Using local FastEmbed: <model> (1024-dim)` for
+    every model — true of the multilingual-e5-large the docs suggest, false of
+    anything else. Found 2026-09-29 testing FastEmbed on Python 3.14 as the
+    torch-free local embedder: `BAAI/bge-small-en-v1.5` logged "1024-dim" and
+    produced 384. Qdrant's collection is sized from a probe, so the only thing
+    wrong was the operator-facing line — the one read when choosing a model.
+    Driven with a stand-in `fastembed` module, so no model is downloaded.
+    """
+    import types, logging
+    import backend.core as core
+
+    class _Vec(list):
+        def tolist(self):
+            return list(self)
+
+    class TextEmbedding:
+        def __init__(self, model_name):
+            self.model_name = model_name
+        def embed(self, texts):
+            return [_Vec([0.1] * 7) for _ in texts]
+
+    fake = types.ModuleType("fastembed"); fake.TextEmbedding = TextEmbedding
+    saved_mod = sys.modules.get("fastembed")
+    saved_env = {k: os.environ.get(k) for k in ("HLM_EMBED_URL", "HLM_EMBED_MODEL", "HLM_LOCAL_EMBED_MODEL")}
+    records = []
+    handler = logging.Handler(); handler.emit = lambda r: records.append(r.getMessage())
+    core.logger.addHandler(handler)
+    try:
+        sys.modules["fastembed"] = fake
+        os.environ.pop("HLM_EMBED_URL", None); os.environ.pop("HLM_EMBED_MODEL", None)
+        os.environ["HLM_LOCAL_EMBED_MODEL"] = "t764/seven-dim-model"
+        with core._embedding_fn_cache_lock:
+            core._embedding_fn_cache.clear()
+        v = core._get_embedding_fn(None)(["a", "b"])
+        assert len(v) == 2 and len(v[0]) == 7, v
+        line = [m for m in records if "FastEmbed" in m]
+        assert line, f"no FastEmbed log line in {records}"
+        assert not re.search(r"\d+-dim", line[0]), (
+            f"the FastEmbed log line states a dimension the model did not produce: {line[0]!r}")
+    finally:
+        core.logger.removeHandler(handler)
+        if saved_mod is None:
+            sys.modules.pop("fastembed", None)
+        else:
+            sys.modules["fastembed"] = saved_mod
+        for k, val in saved_env.items():
+            if val is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = val
+        with core._embedding_fn_cache_lock:
+            core._embedding_fn_cache.clear()
+
+
+def test_t765():
+    """The remote embedder speaks OpenAI's `/v1/embeddings`, with a bearer key.
+
+    It spoke Ollama's `/api/embed` only: no auth header, and a response parser
+    that read `embeddings`/`embedding` — so OpenRouter's `qwen/qwen3-embedding-8b`,
+    the same model as the Ollama `qwen3-embedding:8b` this deployment runs, could
+    not be used. Measured 2026-09-29 through this code path: 4096 dimensions,
+    cosine 0.989-0.994 to the Ollama vector for the same text.
+
+    Driven against a local stub server: `HLM_EMBED_API_KEY` goes out as
+    `Authorization: Bearer`, and only when set; `data[]` is ordered by `index`,
+    which the OpenAI spec does not promise matches list order; the Ollama shape
+    still parses; and the key appears in no log line — the cache key carries a
+    digest, because the eviction log prints part of it.
+    """
+    import threading, logging
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import backend.core as core
+
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append((self.path, self.headers.get("Authorization")))
+            n = len(body["input"])
+            if self.path == "/v1/embeddings":
+                data = [{"object": "embedding", "index": i, "embedding": [float(i)] * 3}
+                        for i in range(n)]
+                out = {"object": "list", "data": list(reversed(data)), "model": body["model"]}
+            else:
+                out = {"embeddings": [[float(i)] * 3 for i in range(n)]}
+            raw = json.dumps(out).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_port}"
+    names = ("HLM_EMBED_URL", "HLM_EMBED_MODEL", "HLM_EMBED_API_KEY", "HLM_LOCAL_EMBED_MODEL")
+    saved = {k: os.environ.get(k) for k in names}
+    records = []
+    handler = logging.Handler(); handler.emit = lambda r: records.append(r.getMessage())
+    core.logger.addHandler(handler)
+    # A marker, not a credential: built so no scanner reads it as one.
+    probe = "t765" + "-bearer-probe"
+
+    def fn(url, key):
+        os.environ["HLM_EMBED_URL"], os.environ["HLM_EMBED_MODEL"] = url, "t765-model"
+        os.environ.pop("HLM_LOCAL_EMBED_MODEL", None)
+        if key:
+            os.environ["HLM_EMBED_API_KEY"] = key
+        else:
+            os.environ.pop("HLM_EMBED_API_KEY", None)
+        return core._get_embedding_fn(None)
+
+    try:
+        with core._embedding_fn_cache_lock:
+            core._embedding_fn_cache.clear()
+        v = fn(base + "/v1/embeddings", probe)(["a", "b", "c"])
+        assert v == [[0.0] * 3, [1.0] * 3, [2.0] * 3], f"data[] not ordered by index: {v}"
+        assert seen[-1] == ("/v1/embeddings", f"Bearer {probe}"), seen[-1]
+
+        v = fn(base + "/api/embed", None)(["a", "b"])
+        assert v == [[0.0] * 3, [1.0] * 3], v
+        assert seen[-1] == ("/api/embed", None), f"a bearer header went out with no key set: {seen[-1]}"
+
+        v = fn(base + "/v1/embeddings", "t765" + "-other-account")(["a"])
+        assert seen[-1][1] == "Bearer t765-other-account", (
+            "a changed key reused the function built for the old one")
+
+        leaked = [m for m in records if "bearer-probe" in m or "other-account" in m]
+        assert not leaked, f"the API key reached the log: {leaked}"
+        with core._embedding_fn_cache_lock:
+            keys = list(core._embedding_fn_cache)
+        assert not any("bearer-probe" in str(k) or "other-account" in str(k) for k in keys), "the raw key is in the cache key"
+    finally:
+        srv.shutdown()
+        core.logger.removeHandler(handler)
+        for k, val in saved.items():
+            if val is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = val
+        with core._embedding_fn_cache_lock:
+            core._embedding_fn_cache.clear()
+
+
+def test_t769():
+    """With no `HLM_DB_PATH` and no `db_path`, the plugin opens the database
+    discovery looks for — and does not strand one written at the old default.
+
+    Profile discovery and every document said the default is
+    `~/.hermes/hermes-layered-memory-dbs/<profile>.db`. The plugin built its
+    default from `get_hermes_home()`, which under a profile is
+    `~/.hermes/profiles/<p>` — so an unconfigured profile wrote where
+    `list_profiles` and cross-profile retrieval never looked. Hidden because the
+    install planner always sets `HLM_DB_PATH`; found by the 2026-09-29
+    documentation-drift audit, with stray `default.db`/`hlm-test.db` files under
+    a driver profile's home as its footprint. Now one `default_db_path`.
+
+    Driven through `initialize()` inside `_isolated_profiles_home`, which points
+    every loaded copy of `real_home` at a temp dir, so nothing lands in the
+    operator's `~/.hermes` (a first draft patched one copy, missed the plugin's,
+    and wrote an empty database into the real directory): a fresh profile gets the
+    documented path; a profile with data at the OLD location and nothing at the
+    new one keeps its data, with a warning naming both — moving the default
+    must not look like memory loss. Discovery is checked to call the same helper.
+    """
+    import logging as _logging
+    plugin = _plugin_module()   # loaded first, so the helper patches its constants too
+    C = sys.modules[plugin.default_db_path.__module__]
+    iso = _isolated_profiles_home()
+    tmp = iso.__enter__()
+    saved_env = {k: os.environ.get(k) for k in ("HLM_DB_PATH", "HERMES_HOME")}
+    records = []
+    h = _logging.Handler(); h.emit = lambda r: records.append(r.getMessage())
+    from backend import logger as _lg
+    _lg.addHandler(h)
+    prof = "t769p"
+    new = os.path.join(tmp, ".hermes", "hermes-layered-memory-dbs", f"{prof}.db")
+    pdir = os.path.join(tmp, ".hermes", "profiles", prof)
+    legacy = os.path.join(pdir, "hermes-layered-memory-dbs", f"{prof}.db")
+    config = {"qdrant_url": QDRANT_URL, "collections": dict(TEST_COLLECTIONS),
+              "max_layer": 2, "enrich_llm": False}
+
+    def opened():
+        prov = plugin.LayeredMemoryProvider(config=dict(config))
+        prov.initialize(session_id="t769-session-000000000000", profile_name=prof,
+                        agent_identity=prof)
+        path = os.path.realpath(prov._backend._db_path)
+        _cleanup_qdrant_coll(prov._backend); prov._backend.close()
+        return path
+
+    try:
+        os.environ.pop("HLM_DB_PATH", None)
+        os.environ["HERMES_HOME"] = pdir
+        os.makedirs(pdir, exist_ok=True)
+        assert C.default_db_path(prof) == new
+
+        assert opened() == os.path.realpath(new), "a fresh profile did not get the documented path"
+        assert not os.path.exists(legacy), "the old per-profile location was created anyway"
+
+        os.makedirs(os.path.dirname(legacy), exist_ok=True)
+        shutil.move(new, legacy)
+        for ext in ("-wal", "-shm"):
+            if os.path.exists(new + ext):
+                os.remove(new + ext)
+        records.clear()
+        assert opened() == os.path.realpath(legacy), (
+            "data at the pre-0.8.125 default was abandoned for an empty new database")
+        assert any(legacy in m and new in m for m in records), (
+            f"no warning naming both locations: {records}")
+    finally:
+        _lg.removeHandler(h)
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        iso.__exit__(None, None, None)
+
+    src = open(os.path.join(_REPO_ROOT, "backend", "backend.py"), encoding="utf-8").read()
+    assert "default_db_path(entry)" in src, "profile discovery no longer uses default_db_path"

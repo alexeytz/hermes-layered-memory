@@ -237,30 +237,55 @@ fails safe). Records with no damage are left untouched.
 
 ## Dependencies Not Installed
 
-HLM's Python dependencies are **not auto-installed** by Hermes. They must be present in the Hermes agent venv. After a Hermes upgrade (which rebuilds the venv), reinstall:
+**Symptom:** the plugin log says `qdrant_client not installed — vector search
+disabled`, `sync_check` reports `Qdrant=0` and `in_sync=False`, and retrieval
+still answers — from the brute-force/FTS fallback. Nothing fails loudly.
+
+**Hermes with its package manager** (`~/.hermes/hermes-agent/pm/` exists) runs
+in an environment it builds itself under `~/.hermes/installs/`, and installs a
+plugin's `plugin.yaml` `pip_dependencies` there on the next launch. HLM
+declares `qdrant-client` and `numpy` since 0.8.123; before that, the first
+`hermes update` onto the package manager built an environment without them —
+seen on 2026-09-29, when every profile ran with vector search off. Check where
+Hermes actually runs and what it has:
 
 ```bash
-# Install into Hermes agent venv (adjust path if yours differs).
-# torch first, from the CPU index: sentence-transformers depends on torch and the
-# default PyPI wheel is the CUDA build, which drags in the nvidia-* runtime and
-# triton — measured at ~4.5G on a CPU-only host, none of it reachable, because
-# HLM hardcodes `device="cpu"`.
-~/.hermes/hermes-agent/venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-~/.hermes/hermes-agent/venv/bin/pip install qdrant-client numpy sentence-transformers
+python3 scripts/check-environment.py --hermes-python   # the runtime interpreter
+~/.venvs/hlm-dev/bin/python scripts/check-environment.py --check   # dev venv: scripts/make-dev-venv.sh
 ```
+
+The `plugin dependencies in the Hermes runtime` line is the verdict for the
+plugin; `pip install` into `~/.hermes/hermes-agent/venv` does **not** reach
+that runtime. If the dependencies are declared and still missing, start Hermes
+once (it syncs before loading plugins), then check each profile's
+`memory.provider`: a sync that cannot resolve a plugin's dependencies disables
+the plugin in every profile, setting `memory.provider: ''` and adding it to
+`plugins.disabled`.
+
+**Hermes without the package manager** runs in its in-tree venv — install there:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/pip install qdrant-client numpy
+```
+
+The optional local embedder (`sentence-transformers`, CPU-only torch) and the
+tested recipe for installing it under the package manager are in the README's
+"Dependencies" section — the torch wheel PyPI serves is the CUDA build, ~4.5G
+on a CPU-only host, none of it reachable because HLM hardcodes `device="cpu"`.
 
 Optional packages (install only if you use the feature):
 
 ```bash
-# Multilingual embeddings (1024-dim, 100+ languages)
+# Multilingual embeddings (1024-dim, 100+ languages), Hermes without the
+# package manager; with it, declare "fastembed" as for sentence-transformers.
 ~/.hermes/hermes-agent/venv/bin/pip install fastembed
 ```
 
 | Package | Required? | Purpose |
 |---------|-----------|---------|
-| qdrant-client >= 1.18 | Yes | Qdrant vector search client |
-| numpy | Yes | Brute-force semantic search (Qdrant-less fallback), cosine similarity |
-| sentence-transformers >= 5.5 | Yes | Default embedding model (all-MiniLM-L6-v2, 384-dim) |
+| qdrant-client >= 1.18 | Yes — declared in `plugin.yaml` | Qdrant vector search client |
+| numpy | Yes — declared in `plugin.yaml` | Brute-force semantic search (Qdrant-less fallback), cosine similarity |
+| sentence-transformers >= 5.5 | Only for the local fallback embedder, and for the test suites | all-MiniLM-L6-v2, 384-dim; unused when `HLM_EMBED_URL` + `HLM_EMBED_MODEL` (both) or `HLM_LOCAL_EMBED_MODEL` is set |
 | fastembed | No | Local multilingual embedding (intfloat/multilingual-e5-large, 1024-dim) |
 | Docker + Docker Compose | No | Qdrant container (optional — remote Qdrant or brute-force mode work without it) |
 
@@ -268,7 +293,7 @@ Optional packages (install only if you use the feature):
 - **No `qdrant-client`:** Vector search disabled, falls back to brute-force SQLite scan (requires `numpy`)
 - **No `numpy`:** Brute-force search returns empty — retrieval falls back to FTS5 BM25 only
 - **No `sentence-transformers` and no remote embed URL:** Embedding fails entirely; `add()` and `rebuild()` cannot compute vectors
-- **No `fastembed`:** Only affects users who set `HLM_LOCAL_EMBED_MODEL` — falls through to sentence-transformers
+- **No `fastembed`:** Only affects users who set `HLM_LOCAL_EMBED_MODEL` — and there it does NOT fall back: the import error disables vector search for the whole backend (`_init_qdrant` logs it), leaving the brute-force/FTS path. Install `fastembed`, or unset the variable
 
 ## Logging Issues
 
@@ -413,6 +438,7 @@ If mismatched, bump **both** `plugin.yaml` and `backend/constants.py` by hand �
 Full reference — every suite, flag, requirement and isolation guarantee: `docs/testing.md` (development repository).
 
 ```bash
+# In the dev venv: scripts/make-dev-venv.sh, then source ~/.venvs/hlm-dev/bin/activate
 # Run full regression suite (~7-20 min — background it)
 cd hermes-layered-memory
 docker compose up -d

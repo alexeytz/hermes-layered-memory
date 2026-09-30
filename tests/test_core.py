@@ -8,7 +8,7 @@ import time
 
 from conftest import (
     _make_backend, _cleanup_db, _cleanup_qdrant_coll,
-    _get_uuid, _docker, _check_qdrant_alive, QDRANT_URL,
+    _get_uuid, _docker, _check_qdrant_alive, _wait_qdrant_ready, QDRANT_URL,
 )
 
 
@@ -156,7 +156,7 @@ def test_t11():
                 break
             time.sleep(1)
         else:
-            _docker("start"); be.close(); _cleanup_db("t11")
+            _docker("start"); _wait_qdrant_ready(); be.close(); _cleanup_db("t11")
             raise AssertionError("Qdrant did not shut down, test skipped")
 
         for _ in range(10):
@@ -170,9 +170,14 @@ def test_t11():
             results = be.retrieve("cb test", max_layer=1)
             assert len(results) >= 1, "Fallback should return results"
 
-        _docker("start"); time.sleep(3)
+        # Hand Qdrant back *serving*, not merely started: a fixed sleep was
+        # enough here and not on the second-machine testbed, where the next
+        # backend came up with vector search off (T174, twice). T756.
+        _docker("start")
+        assert _wait_qdrant_ready(), "Qdrant did not come back within 300s of T11's restart"
     except Exception as e:
-        try: _docker("start"); time.sleep(2)
+        try:
+            _docker("start"); _wait_qdrant_ready()
         except Exception: pass
         raise
     finally:
@@ -1320,7 +1325,19 @@ def test_t174():
     vector: retrieval still returns plausible-looking results and no existing
     test would notice.
     """
+    # Qdrant is this test's precondition, not its subject: `rebuild()` writes
+    # vectors only when a vector store is there. Built in the window after
+    # `T11` restarts the container, the backend came up with vector search off,
+    # no probe got a vector, and the embedder-liveness probe below — written
+    # for a dead *embedder* — then blamed `rebuild()` for a defect it does not
+    # have. 2026-09-28 second-machine retest; it passed 3/3 alone. T756.
+    assert _wait_qdrant_ready(), (
+        "Qdrant is not serving — environmental: this test needs it to exercise "
+        "rebuild(); it says nothing about batching")
     be = _make_backend("t174")
+    assert be._qdrant is not None, (
+        "the backend was built without Qdrant (it was not ready at construction) "
+        "— environmental, not a rebuild() defect; re-run")
     try:
         # Straddle the batch size (64) so there is a full batch and a partial one
         markers = {}

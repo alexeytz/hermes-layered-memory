@@ -6,7 +6,7 @@ config, tool dispatch, and Hermes hooks.
 Config in $HERMES_HOME/hermes-layered-memory.json or config.yaml:
   plugins:
     layered:
-      db_path: $HERMES_HOME/hermes-layered-memory.db
+      db_path: ~/.hermes/hermes-layered-memory-dbs/<profile>.db   # the default; HLM_DB_PATH overrides
       qdrant_url: http://localhost:6333
       qdrant_collection: memories
       embedding_model: all-MiniLM-L6-v2
@@ -33,7 +33,8 @@ from .backend import constants as _C
 from .backend import backend as backend_module
 from .backend.constants import (
     SELF_AUTHORED_SOURCES, UNTRUSTED_OPEN, UNTRUSTED_CLOSE,
-    LOW_CONTENT_TOKENS, real_home, VALID_DATA_TYPES,
+    LOW_CONTENT_TOKENS, real_home, default_db_path, VALID_DATA_TYPES,
+    PREFETCH_LIMIT_DEFAULT, PREFETCH_LIMIT_MAX,
 )
 from .summaries import SummariesBackend
 
@@ -414,7 +415,7 @@ META_MEMORY_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["retrieve", "peek", "add", "update", "delete", "delete_many", "list", "list_profiles", "discover"]},
             "min_score": {"type": "number", "default": 0.0, "description": "For discover: drop candidates scoring below this. Fusion scores are not bounded to 1.0 and are not comparable across queries — use it to trim a noisy result, not as an absolute relevance bar."},
-            "query": {"type": "string", "description": "For retrieve/peek/discover: search query text. NOTE: prefetch auto-injects top 5 results into context — still call retrieve explicitly when the question warrants deeper search beyond what prefetch provided."},
+            "query": {"type": "string", "description": "For retrieve/peek/discover: search query text. NOTE: prefetch auto-injects the top results (5 by default) into context — still call retrieve explicitly when the question warrants deeper search beyond what prefetch provided."},
             "content": {"type": "string", "description": "For add: the memory content (required for add). NOTE: if correcting/updating an existing fact, retrieve first to get its tag/uuid, then call update — do not add a duplicate."},
             "summary": {"type": "string", "description": "For add/update: brief summary of the memory content."},
             "uuid": {"type": "string", "description": "For update/delete: the memory UUID. Use 'tag' as alternative."},
@@ -539,7 +540,7 @@ META_ADVANCED_SCHEMA = {
             "query": {"type": "string", "description": "For traces: filter traces by query string."},
             "topic_only": {"type": "boolean", "default": False, "description": "For reenrich: only enrich missing topics."},
             "keyword_only": {"type": "boolean", "default": False, "description": "For reenrich: only enrich missing keywords."},
-            "since": {"type": "string", "description": "For enrich: only enrich records created since this ISO timestamp."},
+            "since": {"type": "string", "description": "For enrich: only enrich records modified (updated_at) since this ISO timestamp — not created; an edit or a previous enrichment moves a record inside the window."},
             "topic": {"type": "string", "description": "For compact: limit compaction to memories matching this topic."},
             "dry_run": {"type": "boolean", "default": False, "description": "For compact: deprecated alias for execute=false."},
             "execute": {"type": "boolean", "default": False, "description": "For compact: apply the merges. Compaction is DRY-RUN by default because it soft-deletes every original record and replaces them with LLM-generated text. Inspect the dry-run report first."},
@@ -674,6 +675,16 @@ class LayeredMemoryProvider(MemoryProvider):
         # facts it injects are ever used. A UUID counts as "used" when the
         # agent later acts on it — update, delete, feedback, or an explicit
         # retrieve that returns it.
+        #
+        # Read the rate with that definition in mind: it counts *touching*
+        # an injected record, not *using* it. An agent that answers straight
+        # from the Recall block — the case prefetch exists for — scores 0%,
+        # and one that re-retrieves what it was just shown scores high.
+        # Measured 2026-09-28 on hlm-test: a session that re-fetched its
+        # injected answer four times logged "5 injected, 4 used (80.0%)";
+        # the same question answered from the block with zero tool calls
+        # logged "5 injected, 0 used (0.0%)". Low is not proof of neglect,
+        # high is not proof of value.
         self._prefetch_injected = set()
         self._prefetch_used = set()
         self._tag_to_uuid = {}  # tag_number -> uuid
@@ -1061,8 +1072,24 @@ class LayeredMemoryProvider(MemoryProvider):
         # Passing the configured path makes the warning mean what it says.
         # T754.
         _env_db = backend_module._setting("HLM_DB_PATH")
-        db_path = _env_db or self._config.get(
-            "db_path", f"{hermes_home}/hermes-layered-memory-dbs/{profile_name}.db")
+        db_path = _env_db or self._config.get("db_path")
+        if not db_path:
+            # The documented default, shared with profile discovery — see
+            # default_db_path. Until 0.8.125 this was built from
+            # get_hermes_home(), i.e. under the PROFILE's directory, where
+            # discovery never looked. An install that has been writing there
+            # keeps its data: use the old file when it holds some and the
+            # documented one does not exist yet, and say how to settle it.
+            db_path = default_db_path(profile_name)
+            legacy = os.path.join(hermes_home, "hermes-layered-memory-dbs", f"{profile_name}.db")
+            if (os.path.realpath(legacy) != os.path.realpath(db_path)
+                    and not os.path.exists(db_path)
+                    and os.path.isfile(legacy) and os.path.getsize(legacy) > 0):
+                logger.warning(
+                    "initialize: using %s — the default location before 0.8.125, "
+                    "which profile discovery does not see. Move it to %s, or set "
+                    "HLM_DB_PATH to keep it where it is.", legacy, db_path)
+                db_path = legacy
         db_path = db_path.replace("$HERMES_HOME", hermes_home)
         # Resolve ~ to real home (Hermes remaps $HOME)
         _real_home = real_home()
@@ -1326,8 +1353,29 @@ class LayeredMemoryProvider(MemoryProvider):
             f"Skip only if the user explicitly says not to save."
         )
 
+    def _prefetch_limit(self) -> int:
+        """Records prefetch may inject per turn; 0 means prefetch is off.
+
+        Read per turn, so a `layered_config(action="set")` takes effect on the
+        next message. A stored value outside 0..PREFETCH_LIMIT_MAX (the config
+        file is hand-editable, and only `set_config` validates) is clamped
+        rather than trusted: a negative reads as off, a huge one as the cap.
+        """
+        try:
+            n = int(self._backend._config.get(
+                "prefetch_limit", PREFETCH_LIMIT_DEFAULT))
+        except (TypeError, ValueError):
+            n = PREFETCH_LIMIT_DEFAULT
+        return max(0, min(n, PREFETCH_LIMIT_MAX))
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._backend or not query:
+            return ""
+        # `prefetch_limit: 0` turns prefetch off completely — checked before
+        # the retrieve, so an operator who disabled it pays no embedder call
+        # and no query per turn, not merely an empty block.
+        limit = self._prefetch_limit()
+        if limit <= 0:
             return ""
         # Acknowledgements ("ok", "thanks") retrieve as well as real questions
         # do — the vector score doesn't distinguish them — so gate on the query.
@@ -1335,14 +1383,15 @@ class LayeredMemoryProvider(MemoryProvider):
             logger.debug("prefetch: skipped, no retrievable intent in %r", query[:40])
             return ""
         try:
-            results = self._backend.retrieve(query, max_layer=self._max_layer, source="prefetch")
+            results = self._backend.retrieve(query, max_layer=self._max_layer,
+                                             limit=limit, source="prefetch")
             if not results:
                 return ""
             # Register seen UUIDs from prefetch (memory-context injection),
             # but only once the suppression gates have agreed to inject.
             lines = []
             pending_uuids = []
-            for r in results[:5]:
+            for r in results[:limit]:
                 # Sensitive records are never auto-injected. They stay
                 # retrievable, but only when the agent asks for them.
                 if int(r.get("sensitivity") or 0) > 0:
@@ -1885,7 +1934,7 @@ class LayeredMemoryProvider(MemoryProvider):
         # Per-turn extraction is off even when auto_extract is on. It fires
         # every fifth turn on a live conversation — the noisiest possible input,
         # mid-task, where "durable fact" and "current scratch state" are hardest
-        # to tell apart — and each run writes fence-exempt records. Session end
+        # to tell apart — and each run writes records the store keeps. Session end
         # and pre-compress see the whole conversation and know how it turned
         # out. Opt in with `auto_extract_per_turn: true`.
         if not self._config.get("auto_extract_per_turn", False):
@@ -1935,7 +1984,7 @@ class LayeredMemoryProvider(MemoryProvider):
             history = "\n\n".join(turn_parts[-40:])  # last 40 messages
             # Skip trivial sessions, matching on_pre_compress. A health check or
             # a two-message exchange has no durable facts in it, and extracting
-            # from one spends an LLM call to write fence-exempt noise.
+            # from one spends an LLM call to write noise into the store.
             if history:
                 info = self._backend.get_session_info(self._session_id or "")
                 if info and self._backend.classify_session(
@@ -2204,14 +2253,16 @@ class LayeredMemoryProvider(MemoryProvider):
     # ---- Config schema --------------------------------------------------
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
-        from hermes_constants import display_hermes_home
-        _default_db = f"{display_hermes_home()}/hermes-layered-memory.db"
+        # What initialize() actually uses when nothing is configured. This
+        # said `$HERMES_HOME/hermes-layered-memory.db`, a path no version of
+        # the code has used — and Hermes shows it to the operator.
+        _default_db = "~/.hermes/hermes-layered-memory-dbs/<profile>.db"
         return [
             {"key": "db_path", "description": "SQLite database path", "default": _default_db},
             {"key": "qdrant_url", "description": "Qdrant server URL", "default": "http://localhost:6333"},
             {"key": "max_layer", "description": "Default retrieval depth (1-4)", "default": "2",
              "choices": ["1", "2", "3", "4"]},
-            {"key": "layer3_mode", "description": "Reranker mode", "default": "inline",
+            {"key": "layer3_mode", "description": "Reranker mode — only inline reranks; delegate/self skip it", "default": "inline",
              "choices": ["inline", "delegate", "self"]},
         ]
 
@@ -2946,18 +2997,11 @@ class LayeredMemoryProvider(MemoryProvider):
             return self._summaries
         # Lazy init - replicate what initialize() does
         try:
-            from hermes_constants import get_hermes_home
-            hermes_home = str(get_hermes_home())
-            profile_name = getattr(self, '_profile_name', None) or "default"
-            db_path = self._config.get("db_path", f"{hermes_home}/hermes-layered-memory-dbs/{profile_name}.db")
-            db_path = db_path.replace("$HERMES_HOME", hermes_home)
-            # Resolve ~ to real home (Hermes remaps $HOME)
-            _real_home = real_home()
-            if db_path.startswith("~"):
-                db_path = db_path.replace("~", _real_home, 1)
-            elif "$" in db_path:
-                db_path = os.path.expandvars(db_path)
-            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            # A memories-database path used to be computed here, from the
+            # profile's own home, only to makedirs() its directory — nothing
+            # read it. Its one effect was an empty
+            # `~/.hermes/profiles/<p>/hermes-layered-memory-dbs/` in every
+            # profile that summarised anything. Removed in 0.8.125.
             # Read through _setting(), not os.environ. Under a multiplex
             # gateway a profile's .env is loaded into an isolated secret
             # scope, so a direct read returns the root-level value — and

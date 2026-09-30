@@ -1,8 +1,17 @@
 name: hermes-layered-memory
-version: 0.8.119
+version: 0.8.125
 description: "Layered funnel memory — Qdrant + SQLite + fusion + LLM reranker. User-controlled depth, stream exposure."
 author: Alexey T.
 license: MIT
+# Installed by Hermes' package manager (pm) into the environment Hermes runs
+# in: pm reads this list for every profile whose memory.provider names this
+# plugin. Without it a `hermes update` that builds a new environment silently
+# drops them and HLM runs with vector search off. sentence-transformers (the
+# local fallback embedder) is deliberately absent: it needs torch from the CPU
+# index, which a requirement list cannot express. See README "Dependencies".
+pip_dependencies:
+  - "qdrant-client>=1.18"
+  - "numpy"
 hooks:
   - prefetch
   - sync_turn

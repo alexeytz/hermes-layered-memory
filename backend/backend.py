@@ -425,6 +425,20 @@ class LayeredBackend:
                 logger.warning("invalid HLM_LOW_TRUST_ARCHIVE_DAYS=%r, ignoring",
                                archive_days)
 
+        prefetch_limit = _setting("HLM_PREFETCH_LIMIT")
+        if prefetch_limit:
+            try:
+                val = int(prefetch_limit)
+                if 0 <= val <= _C.PREFETCH_LIMIT_MAX:
+                    self._config["prefetch_limit"] = val
+                    self._env_config["prefetch_limit"] = val
+                else:
+                    logger.warning("HLM_PREFETCH_LIMIT must be 0-%d, ignoring",
+                                   _C.PREFETCH_LIMIT_MAX)
+            except ValueError:
+                logger.warning("invalid HLM_PREFETCH_LIMIT=%r, ignoring",
+                               prefetch_limit)
+
         if (_setting("HLM_TRACING") or "").lower() in ("true", "1", "yes"):
             self._config["tracing"] = True
             self._env_config["tracing"] = self._config["tracing"]
@@ -614,8 +628,7 @@ class LayeredBackend:
 
             # 3. Default: ~/.hermes/hermes-layered-memory-dbs/<profile>.db
             if not db_path:
-                db_path = os.path.join(actual_home, ".hermes",
-                                       "hermes-layered-memory-dbs", f"{entry}.db")
+                db_path = _C.default_db_path(entry)
 
             # Expand ~ and env vars in path
             if db_path.startswith("~"):

@@ -238,12 +238,14 @@ deciding what existing clients do about it.
 `sleep`, `decay`, `resolve_conflicts`, and `review` are dry-run until `execute=true`.
 
 **This is stricter than the Hermes plugin, deliberately.** On the plugin,
-`layered_maintenance(action="sleep")` and `decay` execute immediately: the same
-functions run as *automatic housekeeping* at teardown (`__init__.py`'s
-maintenance block calls `be.sleep(...)` on an insert threshold), so gating them
-would disable periodic maintenance. MCP has no such housekeeping role and is
-the unauthenticated surface, so every mutating maintenance action there is
-opt-in. `compact`, `review` and `resolve_conflicts` are dry-run on **both**
+`layered_maintenance(action="sleep")` and `decay` execute immediately. This
+paragraph used to justify that by teardown housekeeping — the plugin's
+`on_session_end` maintenance block runs the same backend functions on an
+insert threshold — but that block calls the backend directly, not the tool
+handler, and is off unless `cleanup.automatic` is set, so gating the plugin's
+door would not disable it (2026-09-29 drift audit). The plugin door is
+immediate by history, not necessity. MCP is the unauthenticated surface, so
+every mutating maintenance action there is opt-in. `compact`, `review` and `resolve_conflicts` are dry-run on **both**
 front ends. If you are comparing the two doors, this row is a difference by
 design, not a parity bug.
 `purge`, `test_cleanup`, and `rebuild` run immediately — there is no dry-run path

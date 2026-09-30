@@ -12,7 +12,7 @@ import pwd
 from typing import Optional
 
 # ── Version (single source of truth) ──────────────────────────────────────
-__version__ = "0.8.119"
+__version__ = "0.8.125"
 
 
 def str_filter_error(label: str, value: object) -> Optional[str]:
@@ -118,6 +118,25 @@ def real_home() -> str:
     get the actual home directory from the password database.
     """
     return pwd.getpwuid(os.getuid()).pw_dir
+
+
+def default_db_path(profile_name: str) -> str:
+    """The memories database a profile uses when neither `HLM_DB_PATH` nor a
+    `db_path` config key names one: `~/.hermes/hermes-layered-memory-dbs/<profile>.db`
+    under the REAL home.
+
+    One definition, because there were two and they disagreed. Profile
+    discovery (`backend/backend.py`) and every document used this path; the
+    plugin's `initialize` built its default from `get_hermes_home()`, which
+    under a profile is `~/.hermes/profiles/<p>` — so a profile that never set
+    `HLM_DB_PATH` wrote its memories where `list_profiles` and cross-profile
+    retrieval never looked. Hidden because `plan-install.py` always sets the
+    variable; found by a documentation-drift audit on 2026-09-29, with stray
+    `default.db`/`hlm-test.db` files under a driver profile's home as its
+    footprint. `T769`.
+    """
+    return os.path.join(real_home(), ".hermes", "hermes-layered-memory-dbs",
+                        f"{profile_name}.db")
 
 
 def resolve_user_path(value: str) -> str:
@@ -543,6 +562,18 @@ ADVANCED_LIMIT_DEFAULTS = {"graph_health": 200, "traces": 10, "discover": 10}
 # 2026-08-26 ox-alpha xhigh round, bundle02 F2.
 ENRICH_MAX_ITEMS_DEFAULT = 10
 
+#: How many records prefetch may inject into a turn, and the ceiling on it.
+#: It was a literal `results[:5]` in `prefetch()`, so an operator who found the
+#: injection unhelpful — measured 2026-09-28 on hlm-test: 13,908 records
+#: injected over 3,001 sessions, and a probe session that re-fetched its
+#: injected answer four times — had no way to shrink it or turn it off short of
+#: editing the plugin. `0` switches prefetch off entirely: it returns before
+#: the retrieve, so no embedder call, no log line per turn, no Recall block.
+#: The ceiling bounds the context an unsolicited block can spend; an agent
+#: that wants more asks with an explicit retrieve, whose own `limit` is 1-200.
+PREFETCH_LIMIT_DEFAULT = 5
+PREFETCH_LIMIT_MAX = 20
+
 #: One default for `compact`'s similarity threshold. There were four values in
 #: five places: the backend signature and the plugin handler said 0.90, the
 #: plugin's own published tool schema said 0.85 — so the model was told one
@@ -733,7 +764,7 @@ EXTRACTION_CONTRACT = (
 )
 
 __all__ = [
-    "real_home", "parse_config_text",
+    "real_home", "default_db_path", "parse_config_text",
     "ENTITY_PATTERNS_DEFAULT", "EXTRACTION_CONTRACT",
     "KEYWORDS_EMPTY_VALUES", "SQL_KEYWORDS_MISSING",
     "EXTRACTION_HOOKS", "SELF_AUTHORED_SOURCES", "UNTRUSTED_OPEN", "UNTRUSTED_CLOSE",
@@ -745,6 +776,7 @@ __all__ = [
     "coerce_tool_bool", "coerce_tool_json",
     "MAX_FIELD_CHARS", "MAX_DATA_ID_CHARS", "MERGE_CONTENT_CHARS",
     "REVIEW_BATCH_LIMIT", "REVIEW_BATCH_ORDER", "ADVANCED_LIMIT_DEFAULTS", "ENRICH_MAX_ITEMS_DEFAULT",
+    "PREFETCH_LIMIT_DEFAULT", "PREFETCH_LIMIT_MAX",
     "COMPACT_SIMILARITY_DEFAULT", "UPDATE_ALLOWED_FIELDS",
     "MAX_SESSION_NAME_CHARS", "MAX_SCOPE_CHARS", "MAX_SOURCE_URL_CHARS",
     "MAX_KEYWORDS",
@@ -779,6 +811,8 @@ _CONFIG_VALUE_TYPES: dict = {
     # reaches 1.342 — the ranges overlap and the absolute scale has moved.
     # Set it per profile after measuring that profile; do not copy a number.
     "prefetch_min_score": float,
+    # Records injected per turn; 0 = prefetch off. See PREFETCH_LIMIT_DEFAULT.
+    "prefetch_limit": int,
     "layer3_mode": str,
     "layer3_reasoning_style": str,
     "layer3_model": str,
@@ -963,6 +997,9 @@ def _validate_config_value(key: str, value: object) -> Optional[str]:
         return f"config key 'max_layer' must be 0-4, got {value}"
     if key == "layer0_top_k" and not (1 <= int(value) <= 200):
         return f"config key 'layer0_top_k' must be 1-200, got {value}"
+    if key == "prefetch_limit" and not (0 <= int(value) <= PREFETCH_LIMIT_MAX):
+        return (f"config key 'prefetch_limit' must be 0-{PREFETCH_LIMIT_MAX} "
+                f"(0 turns prefetch off), got {value}")
     return None
 
 #: Free-text fields a `compact` / `resolve_conflicts` dry-run preview echoes

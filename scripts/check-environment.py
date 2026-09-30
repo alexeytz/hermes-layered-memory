@@ -37,6 +37,47 @@ sys.path.insert(0, ROOT)
 
 OK, WARN, BAD = "ok  ", "warn", "FAIL"
 
+HERMES_ROOT = os.path.expanduser("~/.hermes/hermes-agent")
+#: What the plugin cannot run properly without, in the environment Hermes
+#: loads it into. Must equal `plugin.yaml`'s `pip_dependencies` (as import
+#: names) — `T762` ties the two.
+RUNTIME_REQUIRED = ("qdrant_client", "numpy")
+
+
+def hermes_runtime_python():
+    """(interpreter, how it was found) for the environment Hermes loads the plugin into.
+
+    Since Hermes' package manager (`pm/`) arrived — on this host with the
+    2026-09-28 update — Hermes does not run in `~/.hermes/hermes-agent/venv`:
+    every launch from there re-executes into a PM "generation" environment
+    under `~/.hermes/installs/`, whose path changes on every dependency sync.
+    Checking the old venv then answers a question nobody asked: on 2026-09-29
+    it held `qdrant_client` while Hermes, running elsewhere, did not, and every
+    profile ran with vector search off.
+
+    Found passively, through PM's own read-only accessor (`committed_venv`,
+    documented "Reading this function never creates user state") in a
+    subprocess, so Hermes' tree never joins this process's import path. Not by
+    importing `hermes_cli`: that runs PM's launch step, which SYNCS
+    dependencies when they are stale — and a failed sync disables the plugin
+    in every profile. A check must not be able to do that.
+    """
+    import subprocess
+    if os.path.isdir(os.path.join(HERMES_ROOT, "pm")):
+        code = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+                "from pm.environments import committed_venv, venv_python; "
+                "v = committed_venv(Path(sys.argv[1])); print(venv_python(v) if v else '')")
+        try:
+            out = subprocess.run([sys.executable, "-I", "-c", code, HERMES_ROOT],
+                                 capture_output=True, text=True, timeout=30)
+            path = out.stdout.strip()
+            if out.returncode == 0 and path:
+                return path, "PM's committed environment"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    legacy = os.path.join(HERMES_ROOT, "venv", "bin", "python")
+    return (legacy, "the in-tree venv (Hermes without PM)") if os.path.exists(legacy) else (None, "")
+
 
 def _say(state, label, detail=""):
     print(f"  [{state}] {label}" + (f" — {detail}" if detail else ""))
@@ -112,12 +153,32 @@ def machine_checks() -> bool:
                  f"in {sys.executable}" if not missing else
                  f"missing {missing} in {sys.executable} — see README step "
                  f"'Install the Python dependencies'")
-    venv_py = os.path.expanduser("~/.hermes/hermes-agent/venv/bin/python")
-    if os.path.exists(venv_py) and os.path.realpath(sys.executable) != os.path.realpath(venv_py):
-        _say(WARN, "not the Hermes interpreter",
-             f"the plugin runs in {venv_py}; these checks describe "
-             f"{sys.executable}. Re-run with that interpreter for a verdict "
-             f"that applies to the plugin")
+
+    # The check above describes the interpreter running THIS script — the one
+    # the suites run under. The plugin runs wherever Hermes runs, which is a
+    # separate question with its own verdict.
+    runtime, how = hermes_runtime_python()
+    if runtime is None:
+        _say(WARN, "Hermes runtime", f"no Hermes install found at {HERMES_ROOT}")
+    else:
+        import subprocess
+        probe = ("import importlib.util as u, sys; "
+                 "print(sys.version.split()[0]); "
+                 "print(' '.join(m for m in sys.argv[1:] if u.find_spec(m) is None))")
+        try:
+            out = subprocess.run([runtime, "-I", "-c", probe, *RUNTIME_REQUIRED],
+                                 capture_output=True, text=True, timeout=60)
+            lines = out.stdout.splitlines()
+            version, gone = (lines + ["", ""])[:2]
+            good &= _say(OK if out.returncode == 0 and not gone.strip() else BAD,
+                         "plugin dependencies in the Hermes runtime",
+                         f"Python {version} at {runtime} ({how})" if not gone.strip() else
+                         f"missing {gone.split()} in {runtime} ({how}) — Hermes installs "
+                         f"plugin.yaml's pip_dependencies at its next launch; see README "
+                         f"'Dependencies'")
+        except (OSError, subprocess.SubprocessError) as e:
+            good &= _say(BAD, "plugin dependencies in the Hermes runtime",
+                         f"{runtime}: {type(e).__name__}")
 
     qurl = os.environ.get("HLM_QDRANT_URL", "http://localhost:6333")
     try:
@@ -143,7 +204,16 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true", help="this machine only")
     ap.add_argument("--repo", action="store_true", help="the repo only")
+    ap.add_argument("--hermes-python", action="store_true",
+                    help="print the interpreter Hermes runs the plugin in, and exit")
     args = ap.parse_args()
+    if args.hermes_python:
+        path, _how = hermes_runtime_python()
+        if not path:
+            print(f"no Hermes install found at {HERMES_ROOT}", file=sys.stderr)
+            return 1
+        print(path)
+        return 0
 
     run_repo = args.repo or not args.check
     run_machine = args.check or not args.repo

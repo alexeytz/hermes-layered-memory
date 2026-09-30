@@ -164,7 +164,7 @@ Declared in `plugin.yaml`:
 | Hook | Purpose |
 |------|---------|
 | `on_session_end` | Maintenance pipeline (enrich → consolidate → purge → decay → sync → rebuild) |
-| `prefetch` | Auto-searches memory on each user turn, injecting top 5 results into context. Rationale: local models are unreliable at following tool instructions — they often guess from context instead. Pushing candidates directly into the context window ensures the model sees relevant facts even if it never calls the tool intentionally. Yes, some turns will produce noisy results. That's an accepted trade-off: visible noise you can debug is preferable to invisible tool-call ignorance that causes silent wrong answers. |
+| `prefetch` | Auto-searches memory on each user turn, injecting the top results into context — 5 by default, `prefetch_limit` (0-20) per profile, where `0` switches the hook off before it retrieves anything. Rationale: local models are unreliable at following tool instructions — they often guess from context instead. Pushing candidates directly into the context window ensures the model sees relevant facts even if it never calls the tool intentionally. Yes, some turns will produce noisy results. That's an accepted trade-off: visible noise you can debug is preferable to invisible tool-call ignorance that causes silent wrong answers. |
 | `sync_turn` | Spawns background fact extraction every 5 turns (throttled: 1 per 30s) |
 | `on_pre_compress` | Records session in chain, extracts facts before context compression |
 | `on_memory_write` | Mirrors MEMORY.md/USER.md writes to HLM (if `memory_enabled` is still on) |

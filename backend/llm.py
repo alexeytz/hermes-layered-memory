@@ -951,8 +951,8 @@ def _reasoning_payload(config: dict, base_url: str) -> dict:
     """Resolve the reasoning-control keys to add to a chat-completions body.
 
     `layer3_reasoning_effort`:
-        unset or "none"  → disable, using the spelling this host understands
-        "provider_default" / "" → send nothing, let the model decide
+        unset, "" or "none" → disable, using the spelling this host understands
+        "provider_default"      → send nothing, let the model decide
         anything else ("low"/"medium"/"high"/"minimal") → pass through
     `layer3_reasoning_style` (optional escape hatch):
         "auto" (default) | "openai" | "permissive" | "off"

@@ -17,6 +17,7 @@ import threading
 import array
 from functools import wraps
 import collections
+import hashlib
 import json
 import logging
 import os
@@ -920,9 +921,15 @@ def _get_embedding_fn(embedding_model: Optional[str] = None):
     embed_url = _setting("HLM_EMBED_URL")
     embed_model = _setting("HLM_EMBED_MODEL")
     local_model = _setting("HLM_LOCAL_EMBED_MODEL")
+    embed_key = _setting("HLM_EMBED_API_KEY")
     st_model = embedding_model or "all-MiniLM-L6-v2"
 
-    cache_key = (embed_url, embed_model, local_model, st_model)
+    # The key joins the cache key as a digest, never raw: the eviction log
+    # line below prints a slice of this tuple, and a different key must still
+    # get its own function (two profiles, two accounts).
+    key_id = (hashlib.sha256(embed_key.encode()).hexdigest()[:12]
+              if embed_key else None)
+    cache_key = (embed_url, embed_model, local_model, st_model, key_id)
     with _embedding_fn_cache_lock:
         cached = _embedding_fn_cache.get(cache_key)
         if cached is not None:
@@ -931,14 +938,23 @@ def _get_embedding_fn(embedding_model: Optional[str] = None):
             return cached
 
         if embed_url and embed_model:
-            # Remote embedding endpoint (Ollama, llama.cpp, etc.)
+            # Remote embedding endpoint: Ollama's /api/embed, or any
+            # OpenAI-compatible /v1/embeddings (OpenRouter, vLLM, llama.cpp).
+            # Both take {"model", "input"}; they differ in auth and in the
+            # response shape, handled below. HLM_EMBED_API_KEY is sent as a
+            # bearer token when set — Ollama ignores it, OpenRouter requires
+            # it. Read here, never stored in self._config, so it cannot reach
+            # get_config's output.
             import urllib.request
+            headers = {"Content-Type": "application/json"}
+            if embed_key:
+                headers["Authorization"] = f"Bearer {embed_key}"
             def remote_embed(texts):
                 payload = json.dumps({"model": embed_model, "input": texts}).encode()
                 req = urllib.request.Request(
                     embed_url,
                     data=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                 )
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     result = json.loads(resp.read())
@@ -954,6 +970,15 @@ def _get_embedding_fn(embedding_model: Optional[str] = None):
                 if vectors is None and isinstance(result.get("embedding"), list):
                     # Singular form: one vector for one input.
                     vectors = [result["embedding"]]
+                if vectors is None and isinstance(result.get("data"), list):
+                    # OpenAI shape: {"data": [{"index": i, "embedding": [...]}]}.
+                    # Ordered by `index`, which the spec does not promise
+                    # matches list order; an item without one keeps its place.
+                    items = [d for d in result["data"] if isinstance(d, dict)]
+                    items.sort(key=lambda d: d.get("index", 0) if isinstance(d.get("index"), int) else 0)
+                    vectors = [d.get("embedding") for d in items]
+                    if not all(isinstance(v, list) for v in vectors):
+                        vectors = None
                 if not isinstance(vectors, list) or len(vectors) != len(texts):
                     raise ValueError(
                         f"embedding endpoint {embed_url} (model={embed_model}) returned "
@@ -961,19 +986,23 @@ def _get_embedding_fn(embedding_model: Optional[str] = None):
                         f"{len(vectors) if isinstance(vectors, list) else 'n/a'} vectors for "
                         f"{len(texts)} input(s); expected a list of {len(texts)}. "
                         f"Check that HLM_EMBED_URL points at the batch embedding route "
-                        f"(Ollama: /api/embed, not /api/embeddings)."
+                        f"(Ollama: /api/embed, not /api/embeddings; OpenAI-compatible: "
+                        f"/v1/embeddings)."
                     )
                 return vectors
             fn = remote_embed
             logger.info("Using remote embedding: %s with %s", embed_url, embed_model)
         elif local_model:
-            # Local FastEmbed (multilingual-e5-large, 1024-dim)
+            # Local FastEmbed. The dimension is the model's own — 1024 for the
+            # multilingual-e5-large the docs suggest, 384 for bge-small — and
+            # Qdrant's collection is sized from a probe, so nothing here may
+            # state one. This log line said "(1024-dim)" for every model.
             from fastembed import TextEmbedding
             model = TextEmbedding(model_name=local_model)
             def fastembed_fn(texts):
                 return [v.tolist() for v in model.embed(texts)]
             fn = fastembed_fn
-            logger.info("Using local FastEmbed: %s (1024-dim)", local_model)
+            logger.info("Using local FastEmbed: %s", local_model)
         else:
             # Local sentence-transformers (default all-MiniLM-L6-v2, 384-dim)
             from sentence_transformers import SentenceTransformer

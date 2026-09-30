@@ -169,12 +169,40 @@ def render(a):
     print(f"        {prof_dir}/plugins/hermes-layered-memory")
     print("   Symlink, not a copy: a copy drifts and nothing in the repo notices.")
 
-    step("Install the Python dependencies into the Hermes venv.")
-    print("   The plugin runs inside Hermes' own interpreter, so that is where they")
-    print("   go — not the system python3. Without them HLM still starts, but with")
-    print("   vector search disabled and only a log line to say so (2026-09-28).")
-    print("     ~/.hermes/hermes-agent/venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu")
-    print("     ~/.hermes/hermes-agent/venv/bin/pip install qdrant-client numpy sentence-transformers")
+    step("Install the Python dependencies.")
+    # Hermes' package manager (pm/, upstream 2026-08-29) runs Hermes in an
+    # environment it builds itself and installs a plugin's plugin.yaml
+    # pip_dependencies there; a pip install into the in-tree venv never reaches
+    # it. On 2026-09-29 exactly that left every profile with vector search off
+    # after a `hermes update`, until the plugin declared its dependencies.
+    has_pm = os.path.isdir(os.path.expanduser("~/.hermes/hermes-agent/pm"))
+    if has_pm:
+        print("   Nothing to install for the plugin itself: this Hermes has its")
+        print("   package manager, and HLM's plugin.yaml declares qdrant-client and")
+        print("   numpy — the next Hermes launch installs them into the environment")
+        print("   Hermes runs in. The check in the Verify step confirms it.")
+        if a["embed"] == "local":
+            print("   You chose the local sentence-transformers embedder, which is NOT")
+            print("   declared (it needs torch from the CPU index). Add")
+            print('   "sentence-transformers>=5.5" to plugin.yaml pip_dependencies, then:')
+            print("     cd ~/.hermes/hermes-agent && env \\")
+            print("       UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \\")
+            print("       UV_INDEX_STRATEGY=unsafe-best-match \\")
+            print("       ~/.hermes/tools/python-3.14*/bin/python3 -m hermes_cli.venv_sync")
+            print("   A sync that cannot resolve disables the plugin in every profile")
+            print("   (memory.provider set to ''); check each profile afterwards.")
+            print("   README 'Dependencies' has the measurements and the trade-off.")
+    else:
+        print("   This Hermes has no package manager: install into its in-tree venv,")
+        print("   which is what the plugin runs in. Without them HLM still starts, but")
+        print("   with vector search disabled and only a log line to say so.")
+        print("     ~/.hermes/hermes-agent/venv/bin/pip install qdrant-client numpy")
+        if a["embed"] == "local":
+            print("     ~/.hermes/hermes-agent/venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu")
+            print("     ~/.hermes/hermes-agent/venv/bin/pip install sentence-transformers")
+    print("   The test suites need their own interpreter — Hermes' packages plus")
+    print("   sentence-transformers (CPU-only torch). This builds it, ~30s, once:")
+    print(f"     cd {ROOT} && scripts/make-dev-venv.sh     # ~/.venvs/hlm-dev")
 
     if a["qdrant"] == "docker":
         step("Start Qdrant.")
@@ -218,15 +246,16 @@ def render(a):
         print("   collection changes with the model, so run")
         print("   layered_maintenance(action=\"rebuild\") after switching.")
 
-    step("Verify, before trusting it — with the venv's interpreter.")
-    print("     ~/.hermes/hermes-agent/venv/bin/python scripts/check-environment.py")
+    step("Verify, before trusting it — with the dev venv's interpreter.")
+    print("     ~/.venvs/hlm-dev/bin/python scripts/check-environment.py")
     if a["embed"] == "remote":
         print(f"     # export HLM_EMBED_URL / HLM_EMBED_MODEL in the shell first —")
         print(f"     # the check reads the environment, not the profile's .env.")
     print("   Then, for the full suite (~7-20 min, background it):")
-    print("     ~/.hermes/hermes-agent/venv/bin/python tests/run-regression.py")
+    print("     ~/.venvs/hlm-dev/bin/python tests/run-regression.py")
     print("   The system python3 has none of the dependencies and the suite's own")
-    print("   preflight refuses to start under it.")
+    print("   preflight refuses to start under it. The check's 'plugin dependencies")
+    print("   in the Hermes runtime' line is the one that describes the plugin.")
 
     step("Start a session.")
     print(f"     hermes -p {p} chat -q \"remember that the deploy host is host-01\"")

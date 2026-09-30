@@ -145,8 +145,10 @@ def _check_dependencies():
         for pkg, hint in missing:
             print(f"  fix: {hint}")
         print()
-        print("  Quick restore after Hermes upgrade:")
-        print("  ~/.hermes/hermes-agent/venv/bin/pip install qdrant-client numpy sentence-transformers")
+        print("  These are the SUITE's needs, in the interpreter running it. Build it:")
+        print("    scripts/make-dev-venv.sh        # ~/.venvs/hlm-dev, ~30s")
+        print("    ~/.venvs/hlm-dev/bin/python tests/run-regression.py")
+        print("  The plugin's own runtime is separate — scripts/check-environment.py --check.")
         print("=" * 72 + "\n")
         sys.exit(1)
 
@@ -588,6 +590,37 @@ def _docker(action: str, container: str = None):
         except Exception:
             container = "qdrant"
     subprocess.run(["docker", action, container], capture_output=True, timeout=30)
+
+
+def _wait_qdrant_ready(timeout: float = 300.0) -> bool:
+    """Wait until Qdrant serves its API, not merely until the port answers.
+
+    `T11` stops and restarts the container and used to sleep a fixed three
+    seconds before handing Qdrant to the rest of the suite. On this host that
+    is enough; on the second-machine testbed it was not — twice (2026-09-26 and
+    2026-09-28) the next backend built logged `Qdrant initialization failed:
+    Connection reset by peer`, came up with vector search off, and `T174`
+    blamed `rebuild()` for vectors it had nothing to write into. Asks
+    `/collections`, the call the backend's own initialisation makes. T756.
+
+    **How long is a property of the host.** Measured on the testbed: Qdrant
+    recovers each collection's shards before it listens, and a restart took
+    ~113 seconds with ten collections (16:24:36 recovering -> 16:26:29
+    listening). The first version of this helper waited 60 and failed `T11`
+    there. It returns the moment Qdrant is ready, so a generous ceiling costs a
+    fast host nothing.
+    """
+    import urllib.request
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(QDRANT_URL + "/collections", timeout=5) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
 
 
 def _check_qdrant_alive() -> bool:
