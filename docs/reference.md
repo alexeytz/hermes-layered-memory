@@ -101,7 +101,7 @@ through its pydantic annotations and always refused. One message,
 |--------|-----------|---------|
 | `obsidian_ingest` | `(vault_path)` | Ingest Obsidian vault notes. `vault_path` must resolve inside an allowed root (see `HLM_OBSIDIAN_VAULT_ROOTS`) or a `ValueError` is raised. |
 | `export` | `(format, status, data_type, topic, scope, profile_name, cross_profile)` | Export memories as JSON or Markdown. Returns `{format, data, warning}` — `data` is raw, unfenced stored content (it must round-trip through `import`); `warning` says so |
-| `import` | `(data, mode, target_status)` | Import memories from JSON (or a `.json`/`.md` file path in `data` holding that JSON, contained by `HLM_IMPORT_ALLOWED_ROOTS`). A Markdown *export* is a readable view and cannot be imported — export with `format='json'`. Modes: `skip_existing`, `overwrite`, `new_uuid`. |
+| `import` | `(data, mode, target_status)` | Import memories from JSON (or a `.json`/`.md` file path in `data` holding that JSON, contained by `HLM_IMPORT_ALLOWED_ROOTS`). A Markdown *export* is a readable view and cannot be imported — export with `format='json'`. Modes: `skip_existing`, `overwrite`, `new_uuid`. A record id that is not a canonical uuid is stored as a deterministic uuid5 of itself, with the original in `metadata.imported_uuid` and a `remapped` note in the result — Qdrant accepts only UUID point ids — and a dashed uuid is normalised to hex; re-importing the same file still overwrites. |
 | `backup` | `(dest_dir, keep_days)` | Atomic SQLite backup of both memories and summaries DBs. WAL-safe. Default: 7-day retention. |
 
 ## Configuration

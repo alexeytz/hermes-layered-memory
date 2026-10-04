@@ -9,10 +9,11 @@ import json
 import os
 import re
 import pwd
+import uuid as _uuid_mod
 from typing import Optional
 
 # ── Version (single source of truth) ──────────────────────────────────────
-__version__ = "0.8.125"
+__version__ = "0.8.127"
 
 
 def str_filter_error(label: str, value: object) -> Optional[str]:
@@ -351,6 +352,34 @@ def is_storable_uuid(value) -> bool:
     """Is this id safe to store — a bounded, single-line string?"""
     return (isinstance(value, str) and 0 < len(value) <= 200
             and not UUID_CONTROL_CHARS.search(value))
+
+
+#: Namespace for the ids `import` derives from foreign ids (`T771`). Fixed
+#: forever: changing it would give every re-imported foreign record a new id,
+#: turning an overwrite import into a duplicating one.
+IMPORT_ID_NAMESPACE = _uuid_mod.UUID("6f1c2b4e-9a3d-5e7f-8b21-4c6d0e9f3a57")
+
+
+def import_record_id(value: str) -> str:
+    """The id an imported record is stored under.
+
+    A canonical uuid is kept. Anything else `is_storable_uuid` admits — the
+    import door accepts foreign ids on purpose (`T722`) — becomes a uuid5 of
+    itself: Qdrant accepts only a UUID or an unsigned integer as a point id, so
+    a foreign id stored verbatim could never get a vector. Found by 0.8.126's
+    Tier 2: a driver re-serialised an export by hand, dropped four characters
+    from one uuid, and `import` stored the 28-character result; Qdrant answered
+    `400 … not a valid point ID`, the stores disagreed at equal counts, and
+    every session start attempted a rebuild. Deterministic, so importing the
+    same file twice still overwrites rather than duplicates.
+
+    A *dashed* canonical uuid is normalised to the 32-hex form every write
+    path mints: stored dashed, it got no Qdrant point either — found by
+    `T771`'s first run (SQLite 3, Qdrant 2). Same identity, so no trail is kept.
+    """
+    if is_record_uuid(value):
+        return value if len(value) == 32 else _uuid_mod.UUID(value).hex
+    return _uuid_mod.uuid5(IMPORT_ID_NAMESPACE, value).hex
 
 
 def is_record_uuid(value) -> bool:
@@ -770,7 +799,7 @@ __all__ = [
     "EXTRACTION_HOOKS", "SELF_AUTHORED_SOURCES", "UNTRUSTED_OPEN", "UNTRUSTED_CLOSE",
     "LOW_CONTENT_TOKENS", "EMBED_NULL", "EMBED_BATCH_SIZE",
     "SQL_EMBEDDING_MISSING", "UUID_RE", "is_record_uuid",
-    "UUID_CONTROL_CHARS", "is_storable_uuid", "HEURISTIC_MAP", "DEFAULT_WEIGHTS",
+    "UUID_CONTROL_CHARS", "is_storable_uuid", "IMPORT_ID_NAMESPACE", "import_record_id", "HEURISTIC_MAP", "DEFAULT_WEIGHTS",
     "CONFLICT_THRESHOLDS_DEFAULT", "HISTORY_MAX_SIZE", "HISTORY_ROTATE_KEEP",
     "HLM_TEST_MARKER", "MAX_CONTENT_CHARS", "MAX_METADATA_CHARS",
     "coerce_tool_bool", "coerce_tool_json",

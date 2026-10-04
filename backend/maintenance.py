@@ -2475,6 +2475,21 @@ def import_memories(self, data: str, mode: str = "skip_existing",
                 results["errors"].append(_bad_container)
                 continue
 
+            # A foreign id becomes a deterministic uuid; the original is kept
+            # in metadata so the record can still be traced to its source.
+            # See import_record_id. T771.
+            _stored_id = _C.import_record_id(uuid)
+            if _stored_id != uuid:
+                if not _C.is_record_uuid(uuid):
+                    _meta = dict(rec.get("metadata") or {})
+                    _meta.setdefault("imported_uuid", uuid)
+                    rec["metadata"] = _meta
+                    results.setdefault("remapped", []).append(
+                        f"Record {uuid!r} stored as {_stored_id}: Qdrant needs a "
+                        f"UUID point id; the original is in metadata.imported_uuid")
+                uuid = _stored_id
+                rec["uuid"] = _stored_id
+
             # `keywords` and `backlinks` through the same rules `add()` uses.
             #
             # **Only those two.** The numerics differ here *by design*: `T397`

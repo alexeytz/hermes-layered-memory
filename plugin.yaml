@@ -1,5 +1,5 @@
 name: hermes-layered-memory
-version: 0.8.125
+version: 0.8.127
 description: "Layered funnel memory — Qdrant + SQLite + fusion + LLM reranker. User-controlled depth, stream exposure."
 author: Alexey T.
 license: MIT

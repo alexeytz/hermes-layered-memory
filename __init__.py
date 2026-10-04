@@ -1296,7 +1296,18 @@ class LayeredMemoryProvider(MemoryProvider):
                 _out = handler(clean_args)
                 return _out if isinstance(_out, str) else json.dumps(_out)
             except Exception as e:
-                logger.exception("Layered tool %s(action=%s) failed: %s", tool_name, action, e)
+                # A deliberate refusal — a bad argument the caller can fix —
+                # is not a server fault, and logged as one it read like a
+                # crash: an ERROR line and a full traceback for
+                # `data_type 'USER-DATA:identity' is not a registered type`
+                # (2026-09-30). Same rule the MCP door uses
+                # (_refusal_or_safe_error): ValueError/PermissionError is a
+                # refusal. Its traceback stays available at DEBUG.
+                if isinstance(e, (ValueError, PermissionError)):
+                    logger.warning("Layered tool %s(action=%s) refused: %s", tool_name, action, e)
+                    logger.debug("refusal traceback", exc_info=True)
+                else:
+                    logger.exception("Layered tool %s(action=%s) failed: %s", tool_name, action, e)
                 return tool_error(str(e))
 
         return tool_error(f"Unknown tool: {tool_name}")

@@ -1306,12 +1306,55 @@ def _validate_data_type(self, data_type) -> None:
     """
     if data_type is None:
         return
-    known = set(VALID_DATA_TYPES) | set(getattr(self, "_collection_map", {}) or {})
+    known = _known_data_types(self)
     if data_type not in known:
+        head, sep, tail = data_type.partition(":") if isinstance(data_type, str) else ("", "", "")
+        if sep and head in known:
+            # Reached only when split_qualified_data_type declined to split
+            # because data_id disagreed — so name the exact call, not
+            # register_taxonomy, which is what a model told "not registered"
+            # reaches for, and which would register the glued string.
+            raise ValueError(
+                f"data_type {data_type!r} combines a type and an id. Pass "
+                f"data_type={head!r} and data_id={tail!r} separately "
+                f"(data_id was also given, so it was not split for you).")
         raise ValueError(
             f"data_type {data_type!r} is not a registered type. Known: "
             f"{sorted(known)}. Use the register_taxonomy action to add a new "
             f"one.")
+
+
+def _known_data_types(self) -> set:
+    return set(VALID_DATA_TYPES) | set(getattr(self, "_collection_map", {}) or {})
+
+
+def split_qualified_data_type(self, data_type, data_id):
+    """Accept `data_type="USER-DATA:identity"` as `USER-DATA` + `identity`.
+
+    A model wrote exactly that, twice in one turn, on 2026-09-30 — and HLM
+    taught it: `seed_overview`, injected into the system prompt when
+    `HLM_SEED_OVERVIEW` is on, listed record groups as `` `USER-DATA:identity` ``,
+    a label that reads as one value. The refusal then said "use
+    register_taxonomy to add a new one", which would register the glued string
+    as a type. The overview no longer prints that form; this keeps any caller
+    that learned it working.
+
+    Split only when the reading is unambiguous: the whole string is NOT a
+    registered type (taxonomy names may contain `:`), the part before the first
+    `:` IS one, and `data_id` is absent or already equals the part after it.
+    Anything else is left for `_validate_data_type` to refuse with the exact
+    call to make. `T770`.
+    """
+    if not isinstance(data_type, str) or ":" not in data_type:
+        return data_type, data_id
+    known = _known_data_types(self)
+    if data_type in known:
+        return data_type, data_id
+    head, _, tail = data_type.partition(":")
+    if head in known and tail and data_id in (None, "", tail):
+        logger.info("data_type %r read as data_type=%r, data_id=%r", data_type, head, tail)
+        return head, tail
+    return data_type, data_id
 
 
 def add(self, content: str, summary: str = None, topic: str = None,
@@ -1429,6 +1472,7 @@ def add(self, content: str, summary: str = None, topic: str = None,
     # extend the taxonomy. Reported by the 2026-08-22 ox-alpha write review
     # (F3), which found all four sites (both front ends, add and update) and
     # is fixed here once, at the boundary they share.
+    data_type, data_id = split_qualified_data_type(self, data_type, data_id)
     _validate_data_type(self, data_type)
     # `data_id` type guard, the one update() received in 0.7.88 and this path
     # did not. `_norm_data_id` calls .lower(), so a non-string crashes with an
@@ -2044,6 +2088,10 @@ def update(self, uuid: str, **fields):
 
     # Same validation add() applies. Without it the 0.7.77 guard was trivially
     # bypassable: add with a valid type, then update to anything.
+    if "data_type" in clean:
+        dt, did = split_qualified_data_type(self, clean["data_type"], clean.get("data_id"))
+        if dt != clean["data_type"]:
+            clean["data_type"], clean["data_id"] = dt, did
     _validate_data_type(self, clean.get("data_type"))
 
     # `data_id` must be a string. `_norm_data_id` (and the raw filter sites)
@@ -3118,7 +3166,10 @@ def seed_overview(self) -> str:
 
     lines = [f"## Knowledge Base Overview ({total} records)", ""]
     for dt, did, cnt, avg_tr, srcs in rows:
-        label = f"{dt}:{did}" if did else dt
+        # Written as the two arguments, not `TYPE:id`: that form sat in the
+        # system prompt as one code span, and a model passed it whole as
+        # data_type (2026-09-30, see split_qualified_data_type).
+        label = f"data_type={dt}, data_id={did}" if did else f"data_type={dt}"
         # Fence the label on the same grounds as the excerpt below: `data_id`
         # is classifier output derived from record content and, unlike
         # `data_type`, is written with no allowlist validation
