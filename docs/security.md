@@ -72,7 +72,7 @@ of a model wraps non-self-authored content in `<untrusted_external_doc>` tags:
 | Browse | `_do_list` (`__init__.py`) | content, summary, keywords, backlinks, metadata, topic, data_id, session_name, scope, source_url |
 | Cross-profile discover | `_do_discover` (`__init__.py`), `discover` action (`mcp_server.py`) | topic, data_id |
 | Per-turn auto-injection | `prefetch` (`__init__.py`) | injected text |
-| Session-start overview | `seed_overview` (`backend/store.py`) | top-trusted excerpt; `data_type:data_id` group label when any record in the group is not self-authored |
+| Session-start overview | `seed_overview` (`backend/store.py`) | top-trusted excerpt; the group label (`data_type=…, data_id=…` since 0.8.126 — the old `TYPE:id` span was copied whole into `data_type` by a model) when any record in the group is not self-authored |
 | Duplicate-collision report | `_do_add` (`__init__.py`), `memory_write action="add"` (`mcp_server.py`, since v0.7.55 — the MCP side serialised `existing_content` unfenced until then) | existing_content |
 | Conflict-resolution preview | `_do_resolve_conflicts` (`__init__.py`), `resolve_conflicts` action (`mcp_server.py`) | content, scope, source — the list is `PREVIEW_FENCED_FIELDS` in `backend/constants.py`, read by both doors; `source` carries at group *and* entry level |
 | Compaction preview | `_do_compact` (`__init__.py`), `compact` action/op (`mcp_server.py`) | content, scope, source — same `PREVIEW_FENCED_FIELDS` tuple; `scope` and `source` ride **untruncated** where content is capped at 80 chars |
@@ -186,6 +186,26 @@ this, one `add(content=..., source="agent")` would launder a payload into the
 trusted zone permanently, and it would be re-injected unfenced on every
 subsequent turn. Internal self-authored writes bypass this by calling
 `backend.add()` directly rather than routing through the tool handler.
+
+**One trusted source is earned at the door, never claimed: `user-stated`
+(0.8.128).** Every fact the model stored used to be `tool-call`, which fenced
+the user's own statements too, and the model hedged on them at recall. The
+plugin's `add` door now compares the content with that turn's user message
+(`user_stated_match`, `backend/constants.py`): when at least 75% of its
+significant words are the user's own — digits exactly, other words fuzzily —
+it is stored as `user-stated`, which is in the self-authored set and therefore
+unfenced. Being in that set is also what keeps it unclaimable: a caller
+passing `source="user-stated"` is rewritten at all three doors above, like
+`agent`. The residual risk is stated rather than hidden: an instruction the
+user *pastes* ("remember this: …") is trusted on their say-so, and a single
+injected word inside a long genuine fact can pass the threshold — an
+instruction needs more than one. **Edits do not inherit the trust**: changing
+the text of a `user-stated` record downgrades it to `tool-call` — always, in
+`update()`, for every caller — and the plugin restores it only when it has
+matched the new text against the user's message (`restore_user_stated()`,
+reached from no tool argument and no MCP action); every MCP edit stays
+downgraded. `trust_user_stated` / `HLM_TRUST_USER_STATED` switches it off.
+`T772`.
 
 **LLM-assigned `data_type` is validated.** `enrich_existing`
 (`backend/llm.py`) writes the classifier's `data_type` straight to the

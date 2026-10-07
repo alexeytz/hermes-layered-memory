@@ -70,7 +70,11 @@ import sys
 # correction: nothing ever wrote a memory row with that source. Removing it
 # here changes no runtime behavior (no compaction parent has ever carried it),
 # it just keeps T358's mirror check honest.
-SELF_AUTHORED = {"agent", "hlm-consolidated"}
+#
+# "user-stated" joined the real set in 0.8.128: a fact the add door recognised
+# as the user's own words from that turn (T772). A merge whose parents were all
+# self-authored, user-stated ones included, is trusted for the same reason.
+SELF_AUTHORED = {"agent", "hlm-consolidated", "user-stated"}
 
 
 def _real_home() -> str:

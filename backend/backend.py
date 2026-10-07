@@ -425,6 +425,24 @@ class LayeredBackend:
                 logger.warning("invalid HLM_LOW_TRUST_ARCHIVE_DAYS=%r, ignoring",
                                archive_days)
 
+        trust_us = _setting("HLM_TRUST_USER_STATED")
+        if trust_us:
+            v = trust_us.strip().lower()
+            if v in ("true", "1", "yes", "on", "false", "0", "no", "off"):
+                self._config["trust_user_stated"] = v in ("true", "1", "yes", "on")
+                self._env_config["trust_user_stated"] = self._config["trust_user_stated"]
+            else:
+                logger.warning("invalid HLM_TRUST_USER_STATED=%r, ignoring", trust_us)
+
+        conf_ent = _setting("HLM_CONFIDENT_ENTITY_KEYWORDS")
+        if conf_ent:
+            v = conf_ent.strip().lower()
+            if v in ("true", "1", "yes", "on", "false", "0", "no", "off"):
+                self._config["confident_entity_keywords"] = v in ("true", "1", "yes", "on")
+                self._env_config["confident_entity_keywords"] = self._config["confident_entity_keywords"]
+            else:
+                logger.warning("invalid HLM_CONFIDENT_ENTITY_KEYWORDS=%r, ignoring", conf_ent)
+
         prefetch_limit = _setting("HLM_PREFETCH_LIMIT")
         if prefetch_limit:
             try:
@@ -676,6 +694,7 @@ class LayeredBackend:
     add = _store.add
     _enrich_background = _store._enrich_background
     update = _store.update
+    restore_user_stated = _store.restore_user_stated
     _resync_qdrant_payload = _store._resync_qdrant_payload
     _drop_points_everywhere = _store._drop_points_everywhere
     delete = _store.delete

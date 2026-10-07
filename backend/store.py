@@ -16,7 +16,7 @@ import sqlite3
 import builtins as _builtins
 from typing import Any, Dict, List, Optional
 
-from .constants import (EXTRACTION_HOOKS, HLM_TEST_MARKER, HISTORY_MAX_SIZE,
+from .constants import (USER_STATED_SOURCE, EXTRACTION_HOOKS, HLM_TEST_MARKER, HISTORY_MAX_SIZE,
                         HISTORY_ROTATE_KEEP, VALID_DATA_TYPES,
                         SQL_KEYWORDS_MISSING,
                         UPDATE_ALLOWED_FIELDS,
@@ -2050,6 +2050,15 @@ VALID_STATUSES = frozenset({"active", "archived", "deleted"})
 _PAYLOAD_FIELDS = frozenset({"data_type", "data_id", "session_name"})
 
 
+
+def restore_user_stated(self, uuid: str) -> None:
+    """Mark a record `user-stated` again after an edit the plugin matched
+    against the user's own message (see the downgrade in update()). Reached
+    from no tool argument and no MCP action. T772."""
+    self._get_conn().execute("UPDATE memories SET source = ? WHERE uuid = ? AND status = 'active'",
+                             (USER_STATED_SOURCE, uuid))
+    self._get_conn().commit()
+
 def update(self, uuid: str, **fields):
     if not fields:
         return
@@ -2309,10 +2318,11 @@ def update(self, uuid: str, **fields):
     # Driven 2026-09-27 (`["gpu", "rtx3090", "vram"]` -> `[]`). That is the
     # stated trade — stale keywords stay matchable, none cannot mismatch —
     # but it is not "rather than clear" for that class, and a caller who
-    # wants to keep keywords across a content edit must pass them. Extracting
-    # entities on the high-confidence branch would change `add()` for every
-    # record and, since keywords are embedded, the retrieval baseline T364
-    # gates; that is a measured decision of its own, not a side-fix.
+    # wants to keep keywords across a content edit must pass them. 0.8.129
+    # (#45) extracts entities on the high-confidence branch too, so this path
+    # now re-derives them like any other; switchable via
+    # `confident_entity_keywords`. Keywords reach ranking through BM25 and the
+    # keyword boost — not the vector, which is embedded from content alone.
     if "content" in clean and "keywords" not in clean:
         try:
             enriched = self._enrich_metadata(
@@ -2356,6 +2366,20 @@ def update(self, uuid: str, **fields):
                 "update: %s has a caller-authored summary that still describes "
                 "the replaced content; it is FTS-indexed and will keep matching "
                 "the old wording. Pass summary= to refresh it.", uuid[:8])
+
+    # Trust was granted for what the user said; an edit is not that. Changing
+    # the text of a user-stated record always downgrades it here — for every
+    # caller, MCP included — and the plugin restores it through
+    # restore_user_stated() only when it has matched the new text against the
+    # user's own message. Two statements rather than a flag on this signature:
+    # T703 holds update() to its parameter count, and the gap between them is
+    # a moment of being *more* fenced, which fails safe. T772.
+    _TEXT_FIELDS = ("content", "summary", "topic", "keywords", "metadata", "backlinks")
+    if ((old_record or {}).get("source") == USER_STATED_SOURCE
+            and any(f in clean for f in _TEXT_FIELDS)):
+        clean["source"] = "tool-call"
+        logger.info("update: %s was user-stated; its text changed — now tool-call "
+                    "unless the caller restores it", uuid[:8])
 
     sets = ", ".join(f"{k} = ?" for k in clean)
     values = []

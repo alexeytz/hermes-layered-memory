@@ -109,7 +109,8 @@ def _ensure_entity_patterns_dir(self, dir_path: str):
     together by `T696`. This function used to carry its own literal, and the
     two drifted: the restored set was missing two `software_versions`
     stopwords and the `stable diffusion` alternation. Extracted entities
-    become keywords and keywords are embedded, so a public installation —
+    become keywords, which ranking reads (BM25 over the FTS5 column and
+    `_layer2`'s keyword boost — never the vector), so a public installation —
     which took this path on every first run, because the distribution shipped
     without the file — retrieved measurably worse than the repo it was built
     from: `hard_recall@5` 0.920 -> 0.860 at L0 and L1.
@@ -466,12 +467,21 @@ def _enrich_metadata(self, content: str, summary: str = None,
         if mode != "false" and (mode == "true" or self._config.get("enrich_llm")) \
                 and (not topic or not keywords):
             llm_result = self._llm_classify(content, summary, source=source)
-            return {
+            result = {
                 "data_type": result["data_type"],
                 "data_id": result["data_id"],
                 "topic": topic or llm_result.get("topic"),
                 "keywords": keywords or llm_result.get("keywords", []),
             }
+        # Entities on this branch too (#45). It used to return before the
+        # extraction below, so a record the heuristic was sure of got no
+        # entity keywords at all — and a content-only update(), which
+        # re-derives keywords through this same call, replaced a caller's
+        # ["gpu", "rtx3090", "vram"] with []. Switchable because keywords feed
+        # ranking (BM25 and the keyword boost; they are not embedded):
+        # `confident_entity_keywords` / HLM_CONFIDENT_ENTITY_KEYWORDS.
+        if _C.coerce_tool_bool(self._config.get("confident_entity_keywords", True)):
+            result["keywords"] = _merge_entities(self, result.get("keywords"), content)
         return result
 
     # LLM fallback: low_confidence mode or always enrich
@@ -502,21 +512,27 @@ def _enrich_metadata(self, content: str, summary: str = None,
             "keywords": keywords or [],
         }
 
-    # Entity extraction: merge entities into keywords.
-    # Copy first — result["keywords"] is frequently the caller's own list
-    # object (every branch above assigns the `keywords` argument by
-    # reference), so appending in place mutated it. ingest_obsidian passes
-    # the note's frontmatter `tags` list, which is also stored verbatim in
-    # metadata["tags"], so each note's persisted metadata silently gained
-    # the regex-extracted entities.
-    keywords = list(result.get("keywords") or [])
-    seen = {k.lower() for k in keywords if isinstance(k, str)}
+    result["keywords"] = _merge_entities(self, result.get("keywords"), content)
+    return result
+
+
+def _merge_entities(self, keywords, content: str) -> List[str]:
+    """`keywords` plus the entities extracted from `content`, case-folded unique.
+
+    Copy first — `keywords` is frequently the caller's own list object (every
+    branch of `_enrich_metadata` assigns the argument by reference), so
+    appending in place mutated it. ingest_obsidian passes the note's
+    frontmatter `tags` list, which is also stored verbatim in metadata["tags"],
+    so each note's persisted metadata silently gained the regex-extracted
+    entities.
+    """
+    merged = list(keywords or [])
+    seen = {k.lower() for k in merged if isinstance(k, str)}
     for e in self._extract_entities(content):
         if e.lower() not in seen:
-            keywords.append(e)
+            merged.append(e)
             seen.add(e.lower())
-    result["keywords"] = keywords
-    return result
+    return merged
 
 
 def enrich_existing(self, since: str = None, max_items: int = _C.ENRICH_MAX_ITEMS_DEFAULT,

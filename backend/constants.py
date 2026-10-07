@@ -5,6 +5,7 @@ directly by backend/core.py, backend/backend.py, the method modules and
 __init__.py.
 """
 
+import difflib
 import json
 import os
 import re
@@ -13,7 +14,7 @@ import uuid as _uuid_mod
 from typing import Optional
 
 # ── Version (single source of truth) ──────────────────────────────────────
-__version__ = "0.8.127"
+__version__ = "0.8.129"
 
 
 def str_filter_error(label: str, value: object) -> Optional[str]:
@@ -234,7 +235,68 @@ EXTRACTION_HOOKS: set = frozenset({
 
 SELF_AUTHORED_SOURCES: set = frozenset({
     "agent", "hlm-consolidated",
+    # A fact the user stated in their own words, recognised at the plugin's add
+    # door by `user_stated_match` against that turn's user message (0.8.128).
+    # In this set so every external door rewrites a caller who *claims* it —
+    # `_do_add`, `import_memories`, MCP `memory_write` already rewrite any
+    # self-authored value — and so it is not fenced on recall. See
+    # USER_STATED_SOURCE and `T772`.
+    "user-stated",
 })
+
+#: The source a fact gets when the user said it. See SELF_AUTHORED_SOURCES.
+USER_STATED_SOURCE = "user-stated"
+
+#: Share of a stored fact's significant words that must appear in the user's
+#: own message for it to count as user-stated. Measured 2026-10-04 on twelve
+#: pairs, all classified correctly — paraphrase ("User's favorite color is
+#: cobalt" from "my favourite colour is cobalt") passes; a genuine fact with an
+#: instruction appended falls below it. Known limit: one injected *word* in a
+#: long genuine fact can pass; an instruction needs more than one.
+USER_STATED_MIN_OVERLAP = 0.75
+
+_USER_STATED_STOP = frozenset("""the and for with that this from into onto user
+user's users my me i i'm is are was were be been it its it's of to in on at a an
+as by or our your you we they their there here has have had do does did will
+would should can could please remember note store save that's which what who
+whom whose when where why how also just very really""".split())
+_USER_STATED_TOKEN = re.compile(r"[^\W_]+(?:[-'.][^\W_]+)*", re.UNICODE)
+
+
+def _user_stated_tokens(text) -> list:
+    return [t for t in (m.group(0).lower() for m in _USER_STATED_TOKEN.finditer(str(text or "")))
+            if (len(t) >= 3 or any(c.isdigit() for c in t)) and t not in _USER_STATED_STOP]
+
+
+def user_stated_match(content, user_message) -> bool:
+    """Is `content` substantially in the user's own words from `user_message`?
+
+    Why it exists: every fact the model stored went in as `source="tool-call"`
+    — deliberately, because the model also reads web pages, and an injected
+    instruction it was talked into storing must not come back unfenced. But
+    that fenced the user's own statements too, and on recall the model hedged
+    on them ("…however, it's wrapped in untrusted tags"; testbed, 2026-10-04).
+
+    The distinction that matters is whether the *user* typed it. So: at least
+    `USER_STATED_MIN_OVERLAP` of the content's significant words must appear
+    in the user's message — exactly for anything containing a digit (a port,
+    a version), fuzzily otherwise (ratio ≥ 0.8, so favourite/favorite and
+    colour/color agree). Words the user did not type — an appended
+    instruction, a summary of a web page — pull it under the line. Content
+    with no significant words, or an empty message, never matches.
+    """
+    c, m = _user_stated_tokens(content), set(_user_stated_tokens(user_message))
+    if not c or not m:
+        return False
+
+    def hit(t):
+        if t in m:
+            return True
+        if any(ch.isdigit() for ch in t):
+            return False
+        return any(difflib.SequenceMatcher(None, t, u).ratio() >= 0.8 for u in m)
+
+    return sum(1 for t in c if hit(t)) / len(c) >= USER_STATED_MIN_OVERLAP
 
 # XML fence tags for externally-sourced content
 UNTRUSTED_OPEN = "<untrusted_external_doc>"
@@ -794,6 +856,7 @@ EXTRACTION_CONTRACT = (
 
 __all__ = [
     "real_home", "default_db_path", "parse_config_text",
+    "USER_STATED_SOURCE", "USER_STATED_MIN_OVERLAP", "user_stated_match",
     "ENTITY_PATTERNS_DEFAULT", "EXTRACTION_CONTRACT",
     "KEYWORDS_EMPTY_VALUES", "SQL_KEYWORDS_MISSING",
     "EXTRACTION_HOOKS", "SELF_AUTHORED_SOURCES", "UNTRUSTED_OPEN", "UNTRUSTED_CLOSE",
@@ -842,6 +905,12 @@ _CONFIG_VALUE_TYPES: dict = {
     "prefetch_min_score": float,
     # Records injected per turn; 0 = prefetch off. See PREFETCH_LIMIT_DEFAULT.
     "prefetch_limit": int,
+    # Store a fact the user stated in their own words as source="user-stated"
+    # (trusted, unfenced) instead of "tool-call". Default on. T772.
+    "trust_user_stated": bool,
+    # Merge regex-extracted entities into keywords when the heuristic is
+    # confident too, not only on the uncertain path. Default on. #45, T774.
+    "confident_entity_keywords": bool,
     "layer3_mode": str,
     "layer3_reasoning_style": str,
     "layer3_model": str,
