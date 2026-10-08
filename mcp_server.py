@@ -4,11 +4,13 @@ Exposes memory operations via MCP (Model Context Protocol) for external agents.
 Transport: streamable-http (default) or stdio.
 
 Usage:
-    # Stdio mode (for direct agent use)
+    # Streamable HTTP on 127.0.0.1:3801 — the default, for network/shared access
     python3 mcp_server.py
 
-    # Streamable HTTP mode (for network/shared access)
-    python3 mcp_server.py --transport streamable-http --port 3801
+    # Stdio mode (for direct agent use)
+    python3 mcp_server.py --transport stdio
+
+    python3 mcp_server.py --help      # options; starts nothing
 
 Environment variables:
     HLM_MCP_PATH   Base directory for all profile DBs (e.g., /opt/memory-dbs)
@@ -2824,24 +2826,33 @@ if SEARXNG_URL:
 # Main
 # ---------------------------------------------------------------------------
 
+def _parse_args(argv):
+    """The command line, refused rather than guessed at.
+
+    This was a hand-rolled loop that skipped anything it did not recognise, so
+    `mcp_server.py --help` printed nothing and started a streamable-HTTP server
+    on 127.0.0.1:3801 — asking how to run the server ran it, and held a port.
+    A mistyped `--hots`/`--prot` was dropped the same way, and `--port abc`
+    died with a bare ValueError. Found 2026-10-07 on the second machine, by
+    asking for help before starting the MCP door. `T776`.
+    """
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="mcp_server.py",
+        description="HLM's MCP server. Environment variables: see this file's docstring and docs/mcp.md.")
+    ap.add_argument("-t", "--transport", default="streamable-http",
+                    choices=("streamable-http", "sse", "stdio"),
+                    help="default: streamable-http")
+    ap.add_argument("-H", "--host", default="127.0.0.1",
+                    help="bind address for http transports (default: 127.0.0.1 — localhost for safety; "
+                         "the server does not authenticate, see docs/mcp.md)")
+    ap.add_argument("-p", "--port", type=int, default=3801, help="default: 3801")
+    return ap.parse_args(argv)
+
+
 def main():
-    transport = "streamable-http"
-    host = "127.0.0.1"  # localhost by default for safety
-    port = 3801
-    args = sys.argv[1:]
-    i = 0
-    while i < len(args):
-        if args[i] in ("--transport", "-t") and i + 1 < len(args):
-            transport = args[i + 1]
-            i += 2
-        elif args[i] in ("--port", "-p") and i + 1 < len(args):
-            port = int(args[i + 1])
-            i += 2
-        elif args[i] in ("--host", "-H") and i + 1 < len(args):
-            host = args[i + 1]
-            i += 2
-        else:
-            i += 1
+    opts = _parse_args(sys.argv[1:])
+    transport, host, port = opts.transport, opts.host, opts.port
 
     logger.info("MCP server starting: profile=%s transport=%s host=%s port=%s",
                 PROFILE, transport, host, port)

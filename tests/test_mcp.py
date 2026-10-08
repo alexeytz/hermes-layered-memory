@@ -2456,3 +2456,39 @@ def test_t747():
         assert isinstance(ok, dict) and ok.get("kind") == "data_type", ok
         empty = _call(m.memory_config(action="register_taxonomy", name="T747B", kind=""))
         assert isinstance(empty, dict) and "error" in empty, empty
+
+
+def test_t776():
+    """`mcp_server.py --help` explains the server instead of starting it.
+
+    `main()` parsed `sys.argv` with a hand-rolled loop that skipped anything it
+    did not recognise. So `--help` printed nothing and started a streamable-HTTP
+    server on 127.0.0.1:3801: asking how to run the MCP door ran it and held
+    the port. A mistyped `--hots 0.0.0.0` was dropped silently and the server
+    bound localhost — the safe direction, but the operator was told nothing —
+    and `--port abc` died with a bare `ValueError`. Found 2026-10-07 on the
+    second machine, by asking for help before starting the server for D5.
+
+    Driven as a process: a server that starts would never exit, so a timeout
+    here *is* the old behaviour. `HLM_QDRANT_ENABLED=false` and a throwaway
+    `HERMES_HOME` keep the import from touching anything real.
+    """
+    import subprocess
+    env = dict(os.environ, HLM_QDRANT_ENABLED="false", HERMES_HOME=tempfile.mkdtemp(),
+               HLM_DB_PATH=os.path.join(tempfile.mkdtemp(), "t776.db"))
+
+    def run(*argv):
+        try:
+            r = subprocess.run([sys.executable, _SERVER_PATH, *argv], capture_output=True,
+                               text=True, timeout=90, env=env, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(f"mcp_server.py {' '.join(argv)} did not exit — it started serving")
+        return r.returncode, r.stdout + r.stderr
+
+    rc, out = run("--help")
+    assert rc == 0 and "usage: mcp_server.py" in out and "--transport" in out, (rc, out[-400:])
+    for argv, want in ((("--hots", "0.0.0.0"), "unrecognized arguments"),
+                       (("--port", "abc"), "invalid int value"),
+                       (("--transport", "websocket"), "invalid choice")):
+        rc, out = run(*argv)
+        assert rc == 2 and want in out, (argv, rc, out[-300:])

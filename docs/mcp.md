@@ -338,7 +338,12 @@ python3 mcp_server.py --transport stdio             # stdio mode (for direct age
 python3 mcp_server.py --transport streamable-http   # HTTP mode (explicit, localhost)
 python3 mcp_server.py --transport streamable-http --host 0.0.0.0  # HTTP mode (network)
 python3 mcp_server.py --port 9999                   # custom port
+python3 mcp_server.py --help                        # the options; starts nothing
 ```
+
+An unknown or mistyped flag is refused with exit 2. Until 0.8.130 it was
+skipped silently — so `--help` *started* the server on 127.0.0.1:3801, and a
+`--hots 0.0.0.0` bound localhost without a word (`T776`).
 
 ### Troubleshooting
 

@@ -14,7 +14,7 @@ import uuid as _uuid_mod
 from typing import Optional
 
 # ── Version (single source of truth) ──────────────────────────────────────
-__version__ = "0.8.129"
+__version__ = "0.8.130"
 
 
 def str_filter_error(label: str, value: object) -> Optional[str]:
