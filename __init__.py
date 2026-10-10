@@ -1816,6 +1816,17 @@ class LayeredMemoryProvider(MemoryProvider):
                 else:
                     stored += 1
             except Exception as e:
+                # Shutdown closes the backend after a 30s wait (T496), and it
+                # can land *inside* an iteration — after the check at the top
+                # of the loop. The next attribute access then raises, and this
+                # handler counted a fact shutdown dropped as one extraction
+                # rejected, with an `[E002] 'NoneType' object has no attribute
+                # 'check_surfaced_echo'` line that read like a defect (the
+                # 2026-10-09 Tier 2 gate filed it as one). Shutdown has already
+                # warned that the remaining facts were not stored. T779.
+                if not self._backend:
+                    logger.debug("extraction: backend closed mid-fact, skipping remaining facts")
+                    break
                 rejected += 1
                 logger.debug("[E002] extraction: failed to store fact: %s", e)
 

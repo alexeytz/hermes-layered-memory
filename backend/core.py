@@ -787,6 +787,18 @@ def _suffix_enabled() -> bool:
 HEURISTIC_CONFIDENCE_MIN = 0.6
 
 
+def clamp_cosine(value: float) -> float:
+    """A cosine similarity held to [-1, 1].
+
+    float32 arithmetic overshoots on identical vectors: Qdrant's own cosine
+    score and the numpy matrix product both reported `1.000001` for
+    byte-identical content, and that figure reached callers in dedup verdicts
+    (the 2026-10-09 Tier 2 gate noted it). Every threshold compared against is
+    at most 1.0, so clamping changes what is reported, never what is decided.
+    """
+    return max(-1.0, min(1.0, float(value)))
+
+
 
 def _valid_timestamp(value) -> bool:
     """Is this an ISO-8601 timestamp we would have written ourselves?

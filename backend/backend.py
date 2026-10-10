@@ -279,12 +279,28 @@ class LayeredBackend:
             # would have made all four incidents visible on the spot instead of
             # via a vector count days later.
             # 2026-08-26 ox-alpha round 2, out-of-scope note on bundle02.
-            if self._db_path and os.path.abspath(dbp) != os.path.abspath(self._db_path):
-                logger.warning(
-                    "HLM_DB_PATH=%s overrides the db_path passed to LayeredBackend "
-                    "(%s). The environment wins here; if you meant to isolate this "
-                    "backend, unset HLM_DB_PATH — an explicit argument does not "
-                    "protect you.", dbp, self._db_path)
+            #
+            # **Refused since 0.8.132, not warned.** The fifth incident came with
+            # the warning in place: on 2026-10-09 an e2e driver built
+            # `LayeredBackend(db_path=<hlm-test.db>, profile_name="hlm-test")`
+            # in a tool shell carrying its own profile's HLM_DB_PATH, the
+            # warning scrolled past in a tool transcript, and an import sweep
+            # over the driver's database deleted 6 of hlm-test's vectors —
+            # `orphan_sweep_refused` let it through because the import had just
+            # upserted the 31 points its overlap check counts. Neither side
+            # wins silently: explicit-wins would move the hazard to a caller
+            # passing a stale default while the operator relocated the store.
+            # Both production front ends resolve HLM_DB_PATH before
+            # constructing and pass it (the plugin, T754; MCP's _get_db_path,
+            # which refuses a mismatch the same way), so only an ad-hoc
+            # construction can disagree — and that is the one to stop. T783.
+            if self._db_path and os.path.realpath(dbp) != os.path.realpath(self._db_path):
+                raise ValueError(
+                    "LayeredBackend was given db_path=%s but HLM_DB_PATH=%s, and "
+                    "they disagree. Refusing rather than guessing which database "
+                    "you meant: pass the same path, or run without HLM_DB_PATH "
+                    "(`env -u HLM_DB_PATH ...`) to use the explicit one."
+                    % (self._db_path, dbp))
             self._db_path = dbp
 
         # Which keys this env pass owns. The config layers are documented as

@@ -16153,3 +16153,123 @@ def test_t774():
         assert got["keywords"] == [], f"switch off still extracted: {got}"
     finally:
         _cleanup_qdrant_coll(be); be.close(); _cleanup_db("t774")
+
+
+def test_t779():
+    """A backend closed by shutdown mid-fact stops extraction; it is not a rejected fact.
+
+    Shutdown waits 30s for in-flight extraction, then closes the backend and
+    warns that the remaining facts were not stored (`T496`). The loop checks
+    for a closed backend at the top of each fact, but the close can land
+    *inside* one — on 2026-10-09 it fell between the embed and the echo check,
+    so `self._backend.check_surfaced_echo` raised on `None`, the generic handler
+    counted the fact as **rejected**, and the log said `[E002] extraction:
+    failed to store fact: 'NoneType' object has no attribute
+    'check_surfaced_echo'` — which that Tier 2 run's gate filed as a defect.
+    The ledger then blamed the extractor for a fact shutdown dropped.
+
+    Driven with a stub whose embed call closes the provider's backend, the
+    way shutdown does; no Qdrant or model is involved.
+    """
+    plugin = _plugin_module()
+    p = plugin.LayeredMemoryProvider()
+
+    class _Closing:
+        _collection_map = {}
+
+        def _embed_batch(self, texts):
+            p._backend = None          # shutdown's close, landing mid-iteration
+            return [[0.0]]
+
+        def check_surfaced_echo(self, *a, **k):
+            raise AssertionError("must not be reached through a closed backend")
+
+    p._backend = _Closing()
+    stored, rejected, superseded, echoes = p._store_extracted_facts(
+        [{"content": "[HLM-TEST] t779 one"}, {"content": "[HLM-TEST] t779 two"}],
+        "t779", "t779", "extraction")
+    assert (stored, rejected, superseded, echoes) == (0, 0, 0, 0), (
+        f"a fact dropped by shutdown was counted: stored={stored} rejected={rejected}")
+
+
+def test_t782():
+    """A cosine similarity is reported within [-1, 1], however float32 rounds.
+
+    The 2026-10-09 Tier 2 gate noted a dedup verdict reporting
+    `similarity 1.000001` for byte-identical content. float32 overshoots on
+    identical vectors — Qdrant's own cosine score and the numpy matrix product
+    in the SQLite dedup arm both do — and the raw figure reached the caller.
+    Harmless to every decision (no threshold exceeds 1.0) but a number that
+    cannot be a cosine invites a reader to distrust the ones that are.
+
+    Driven on the SQLite exact-scan arm with a vector that overshoots in
+    float32 (seed 0: `1.0000001192…` against itself — asserted, so a change of
+    numpy that stopped overshooting would make this test say so rather than
+    pass vacuously), and on `_cosine_similarity`. The verdict must still be a
+    duplicate: clamping changes what is reported, not what is decided.
+    """
+    import numpy as np
+    from backend.core import clamp_cosine
+    w = np.random.RandomState(0).rand(4096).astype(np.float32)
+    raw = float((w @ w) / (np.linalg.norm(w) ** 2))
+    assert raw > 1.0, f"probe no longer overshoots ({raw!r}) — pick another vector"
+    assert clamp_cosine(raw) == 1.0 and clamp_cosine(-1.5) == -1.0 and clamp_cosine(0.42) == 0.42
+
+    be = _make_backend("t782")
+    try:
+        vec = [float(x) for x in w]
+        be.add("[HLM-TEST] t782 probe record", embedding=vec, force=True, data_type="CUSTOM")
+        hit = be._check_duplicate_sqlite(vec, "CUSTOM", 0.97, 0.92)
+        assert hit and hit.get("status") == "duplicate", hit
+        assert -1.0 <= hit["similarity"] <= 1.0, f"reported similarity {hit['similarity']!r}"
+        assert -1.0 <= be._cosine_similarity(vec, vec) <= 1.0
+    finally:
+        _cleanup_qdrant_coll(be); be.close(); _cleanup_db("t782")
+
+
+def test_t783():
+    """`LayeredBackend` refuses an explicit `db_path` that `HLM_DB_PATH` contradicts.
+
+    The environment variable used to win over the constructor argument,
+    silently until 2026-08-26 and with a WARNING after. It is the one mechanism
+    behind five incidents: 44 of hlm-test's vectors deleted on 2026-08-25, ~90
+    on 2026-08-26, review probes writing into the live profile-b store,
+    cycle 21's sweep, and on 2026-10-09 an e2e driver whose tool shell carried
+    its own profile's `HLM_DB_PATH`: it built
+    `LayeredBackend(db_path=<hlm-test.db>, profile_name="hlm-test")`, got the
+    driver's database, and an import sweep deleted 6 of hlm-test's vectors. The
+    warning was printed; it scrolled past in a tool transcript.
+
+    Now neither side wins silently. Agreement constructs (the plugin and MCP
+    resolve `HLM_DB_PATH` first and pass the same path); disagreement raises a
+    `ValueError` naming both, *before* any database is opened — asserted by the
+    absence of the file it would have created. No variable, no question.
+    """
+    import tempfile
+    from backend.backend import LayeredBackend
+    tmp = tempfile.mkdtemp(prefix="hlm-t783-")
+    explicit, env_db = os.path.join(tmp, "explicit.db"), os.path.join(tmp, "env.db")
+    prev = os.environ.get("HLM_DB_PATH")
+    try:
+        os.environ["HLM_DB_PATH"] = env_db
+        try:
+            LayeredBackend(db_path=explicit, profile_name="t783", config={"qdrant_enabled": False})
+        except ValueError as e:
+            assert explicit in str(e) and env_db in str(e), f"refusal does not name both paths: {e}"
+        else:
+            raise AssertionError("a contradicting HLM_DB_PATH was accepted — the backend opened some database")
+        assert not os.path.exists(env_db) and not os.path.exists(explicit), (
+            "the refusal came after a database was opened")
+        be = LayeredBackend(db_path=env_db, profile_name="t783", config={"qdrant_enabled": False})
+        assert os.path.realpath(be._db_path) == os.path.realpath(env_db)
+        be.close()
+        os.environ.pop("HLM_DB_PATH")
+        be = LayeredBackend(db_path=explicit, profile_name="t783", config={"qdrant_enabled": False})
+        assert os.path.realpath(be._db_path) == os.path.realpath(explicit)
+        be.close()
+    finally:
+        if prev is None:
+            os.environ.pop("HLM_DB_PATH", None)
+        else:
+            os.environ["HLM_DB_PATH"] = prev
+        shutil.rmtree(tmp, ignore_errors=True)

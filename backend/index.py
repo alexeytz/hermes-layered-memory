@@ -33,6 +33,7 @@ from .core import (
     _to_qdrant_id,
     _pack_embedding,
     _unpack_embedding,
+    clamp_cosine,
     logger,
     _norm_data_id,
 )
@@ -303,7 +304,7 @@ def _check_duplicate(self, embedding: List[float], data_type: str, threshold: fl
         qdrant_answered = True
 
         for hit in resp.points:
-            similarity = hit.score if hasattr(hit, 'score') else 1.0 - hit.distance
+            similarity = clamp_cosine(hit.score if hasattr(hit, 'score') else 1.0 - hit.distance)
             if similarity >= threshold:
                 uuid = _from_qdrant_id(hit.id)
                 # status + superseded_by, matching _check_duplicate_sqlite. The
@@ -420,7 +421,7 @@ def _check_duplicate_sqlite(self, embedding: List[float], data_type: str,
     norms[norms == 0] = np.inf  # zero-norm rows score 0, never selected
     sims = (matrix @ query_vec) / norms
     best_idx = int(np.argmax(sims))
-    best_sim = float(sims[best_idx])
+    best_sim = clamp_cosine(sims[best_idx])
     best_uuid = uuids[best_idx]
 
     # `existing_content` is what makes the verdict actionable: both notes below
@@ -560,7 +561,7 @@ def check_surfaced_echo(self, content: str, uuids, threshold: float = None,
     norms[norms == 0] = np.inf
     sims = (matrix @ query_vec) / norms
     best_idx = int(np.argmax(sims))
-    best_sim = float(sims[best_idx])
+    best_sim = clamp_cosine(sims[best_idx])
     if best_sim >= threshold:
         return {"uuid": cand_uuids[best_idx], "similarity": best_sim}
     return None
@@ -614,7 +615,7 @@ def _check_contradiction(self, embedding: List[float], data_type: str,
         )
 
         for hit in resp.points:
-            similarity = hit.score if hasattr(hit, 'score') else 1.0 - hit.distance
+            similarity = clamp_cosine(hit.score if hasattr(hit, 'score') else 1.0 - hit.distance)
             # Below dedup threshold but above conflict threshold
             if similarity >= dedup_threshold:
                 continue  # Too similar — would be caught by dedup
@@ -1616,7 +1617,7 @@ def _cosine_similarity(self, vec_a, vec_b):
     norm_b = np.linalg.norm(b)
     if norm_a == 0 or norm_b == 0:
         return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
+    return clamp_cosine(np.dot(a, b) / (norm_a * norm_b))
 
 
 def _jaccard_similarity(self, set_a, set_b):
